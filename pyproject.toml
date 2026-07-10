@@ -1,0 +1,13 @@
+[project]
+name = "physatformer"
+version = "0.1.0"
+description = "Physics-Guided Transformer for Satellite Telemetry"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pandas",
+    "numpy",
+    "torch",
+    "scikit-learn",
+    "matplotlib",
+    "tqdm",
+]

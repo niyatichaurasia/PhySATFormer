@@ -1,0 +1,134 @@
+# ==========================================================
+# PhySATFormer .gitignore
+# ==========================================================
+
+# -----------------------
+# Python
+# -----------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# -----------------------
+# Virtual Environments
+# -----------------------
+.venv/
+venv/
+env/
+ENV/
+
+# -----------------------
+# Python Packaging
+# -----------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# -----------------------
+# Testing
+# -----------------------
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# -----------------------
+# Type Checkers
+# -----------------------
+.mypy_cache/
+.pytype/
+.pyre/
+
+# -----------------------
+# Jupyter
+# -----------------------
+.ipynb_checkpoints/
+
+# -----------------------
+# IDE
+# -----------------------
+.vscode/
+.idea/
+*.iml
+
+# -----------------------
+# OS Files
+# -----------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -----------------------
+# Logs
+# -----------------------
+logs/
+*.log
+
+# -----------------------
+# Model Checkpoints
+# -----------------------
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+
+# -----------------------
+# Generated Outputs
+# -----------------------
+outputs/
+results/
+figures/
+predictions/
+
+# -----------------------
+# Temporary Files
+# -----------------------
+temp/
+tmp/
+temp_channel*/
+*.tmp
+
+# -----------------------
+# Research Cache
+# -----------------------
+.cache/
+
+# -----------------------
+# Dataset
+# -----------------------
+data/raw/
+data/processed/
+*.zip
+*.tar
+*.gz
+*.pickle
+*.pkl
+
+# -----------------------
+# Local Configuration
+# -----------------------
+.env
+.env.*
+*.env
+
+# -----------------------
+# UV
+# -----------------------
+.python-version
+
+# Ignore local lockfile if you don't want reproducible dependency locking.
+# If you DO want reproducible environments, comment out the next line.
+# uv.lock
+
+# -----------------------
+# Miscellaneous
+# -----------------------
+*.bak
+*.swp
+*.swo
