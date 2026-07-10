@@ -95,3 +95,18 @@ CHANNEL_FILE_PREFIX = "channel_"
 TELECOMMAND_FILE_PREFIX = "telecommand_"
 
 CHANNEL_FILE_EXTENSION = ".zip"
+
+#=======================================================
+from pathlib import Path
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+MISSION_ROOT = Path(
+    os.getenv(
+        "PHYSATFORMER_DATASET",
+        "data/raw/Mission1",
+    )
+)

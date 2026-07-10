@@ -10,4 +10,5 @@ dependencies = [
     "scikit-learn",
     "matplotlib",
     "tqdm",
+    "python-dotenv>=1.2.2",
 ]

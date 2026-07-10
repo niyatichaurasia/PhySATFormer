@@ -1,14 +1,9 @@
-from pathlib import Path
 
 from src.core.mission import Mission
 
 from src.preprocessing.pipeline import TelemetryPipeline
 
-
-
-MISSION_ROOT = Path(
-    r"C:\Users\Niyati Chaurasia\STORAGE\DATASETS\Mission1"
-)
+from src.utils.constants import MISSION_ROOT
 
 def main():
 
