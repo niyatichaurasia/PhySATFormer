@@ -1,11 +1,11 @@
-
-from src.core.mission import Mission
-
-from src.preprocessing.pipeline import TelemetryPipeline
+"""Day 2 integration test."""
 
 from src.utils.constants import MISSION_ROOT
+from src.core.mission import Mission
+from src.preprocessing.pipeline import TelemetryPipeline
 
-def main():
+
+def main() -> None:
 
     print("=" * 60)
     print("PhySATFormer - Day 2 Integration Test")
@@ -15,7 +15,7 @@ def main():
 
     pipeline = TelemetryPipeline(
         window_size=128,
-        stride=32,
+        stride=1,
         normalization_method="zscore",
         train_ratio=0.70,
         validation_ratio=0.15,
@@ -23,48 +23,30 @@ def main():
         direction="nearest",
     )
 
-    train_ds, val_ds, test_ds = pipeline.build(
-        mission,
-        [
-            "channel_1",
-            "channel_2",
-            "channel_3",
-        ],
+    train_dataset, validation_dataset, test_dataset = pipeline.build(
+        mission=mission,
+        channel_ids=[1, 2, 3],
+        max_rows=50000,
     )
-
-
 
     print("\nDatasets")
 
-    print("Train:", len(train_ds))
-    print("Validation:", len(val_ds))
-    print("Test:", len(test_ds))
+    print(f"Train      : {len(train_dataset)}")
+    print(f"Validation : {len(validation_dataset)}")
+    print(f"Test       : {len(test_dataset)}")
 
-    print("\nChecking first sample...")
+    index, window = train_dataset[0]
 
-    sample = train_ds[0]
+    print("\nFirst Sample")
 
-    if len(sample) == 2:
-
-        idx, window = sample
-
-        print("Index:", idx)
-        print("Shape:", window.shape)
-        print("dtype:", window.dtype)
-
-    else:
-
-        idx, window, label = sample
-
-        print("Index:", idx)
-        print("Shape:", window.shape)
-        print("dtype:", window.dtype)
-        print("Label:", label)
+    print(f"Index : {index}")
+    print(f"Shape : {window.shape}")
+    print(f"Dtype : {window.dtype}")
 
     print("\nStatistics")
 
-    print("Mean:", float(window.mean()))
-    print("Std :", float(window.std()))
+    print(f"Mean : {window.mean().item():.6f}")
+    print(f"Std  : {window.std().item():.6f}")
 
     print("\n" + "=" * 60)
     print("DAY 2 PASSED")

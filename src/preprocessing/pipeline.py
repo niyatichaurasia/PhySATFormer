@@ -94,7 +94,7 @@ class TelemetryPipeline:
     # Public API
     # ------------------------------------------------------------------
     def build(
-        self, mission: Mission, channel_ids: List[str]
+        self, mission: Mission, channel_ids: List[str], max_rows: int | None = None
     ) -> Tuple[MissionDataset, MissionDataset, MissionDataset]:
         """
         Run the full preprocessing pipeline for a given mission.
@@ -102,6 +102,14 @@ class TelemetryPipeline:
         Args:
             mission: Mission object to be preprocessed.
             channel_ids: Telemetry channel identifiers to assemble.
+            max_rows: Optional cap on the number of synchronized telemetry
+                rows to process, applied immediately after assembly and
+                before the chronological train/validation/test split. This
+                is intended ONLY for development and debugging on
+                resource-constrained machines (e.g. quickly iterating on a
+                small slice of data). Leaving it as None (the default)
+                processes the full dataset and preserves existing
+                production behavior. Must be a positive int if provided.
 
         Returns:
             Tuple of (train_dataset, validation_dataset, test_dataset).
@@ -112,6 +120,18 @@ class TelemetryPipeline:
         logger.debug(
             "Telemetry assembled: %d synchronized samples", len(synchronized_df)
         )
+
+        if max_rows is not None:
+            if max_rows <= 0:
+                raise ValueError(
+                    f"max_rows must be positive, got {max_rows}."
+                )
+            synchronized_df = synchronized_df.iloc[:max_rows]
+            logger.debug(
+                "Synchronized telemetry truncated to max_rows=%d "
+                "(development/debugging mode)",
+                max_rows,
+            )
 
         train_df, validation_df, test_df = self._split_synchronized_telemetry(
             synchronized_df
