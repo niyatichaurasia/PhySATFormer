@@ -3,6 +3,10 @@
 This module centralizes dataset schema, directory names,
 default configuration values, and project-wide constants.
 """
+from pathlib import Path
+import os
+
+from dotenv import load_dotenv
 
 # ==========================================================
 # Dataset Directories
@@ -97,10 +101,7 @@ TELECOMMAND_FILE_PREFIX = "telecommand_"
 CHANNEL_FILE_EXTENSION = ".zip"
 
 #=======================================================
-from pathlib import Path
-import os
 
-from dotenv import load_dotenv
 
 load_dotenv()
 

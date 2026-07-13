@@ -21,7 +21,6 @@ def main() -> None:
     # Metadata
     print("\n2. Loading Metadata...")
 
-    channels = mission.channels
     labels = mission.labels
     telecommands = mission.telecommands
     anomaly_types = mission.anomaly_types
