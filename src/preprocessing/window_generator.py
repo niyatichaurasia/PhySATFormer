@@ -1,18 +1,20 @@
 """
 src/preprocessing/window_generator.py
 
-WindowGenerator: converts synchronized multivariate telemetry into
-fixed-length temporal windows suitable for Transformer training.
+WindowGenerator: converts synchronized multivariate telemetry, together
+with its aligned dense channel-wise anomaly labels, into fixed-length
+temporal windows suitable for Transformer training.
 
 This module is strictly responsible for sequence (window) generation.
 It does not normalize, synchronize, interpolate, fill missing values,
-engineer features, or perform any machine learning.
+engineer features, collapse/aggregate labels, or perform any machine
+learning.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Final
+from typing import Final, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,22 +47,27 @@ class InsufficientDataError(WindowGenerationError):
 
 class WindowGenerator:
     """
-    Converts a synchronized multivariate telemetry DataFrame into
-    fixed-length sliding windows.
+    Converts synchronized multivariate telemetry, together with its
+    aligned dense channel-wise anomaly labels, into fixed-length sliding
+    windows.
 
     Responsibilities:
-        - Validate the input DataFrame (DatetimeIndex, sorted, numeric).
+        - Validate the input telemetry DataFrame (DatetimeIndex, sorted,
+          numeric) and the dense label matrix (matching shape).
         - Slide a fixed-size window of length `window_size` across the
           time axis, advancing by `stride` rows at a time.
-        - Return the resulting windows as a single numpy array of shape
-          (number_of_windows, window_size, number_of_channels).
+        - Return the resulting telemetry windows and label windows as two
+          numpy arrays, each of shape
+          (number_of_windows, window_size, number_of_channels), such that
+          every telemetry window corresponds exactly to the same
+          timestamp range in the label matrix.
 
     Explicitly NOT responsible for:
         - Normalization / scaling
         - Synchronization / merging of channels
         - Interpolation or gap filling
         - Feature engineering
-        - Label generation or forecasting targets
+        - Collapsing, aggregating, or majority-voting labels
         - Any machine learning logic
     """
 
@@ -94,30 +101,56 @@ class WindowGenerator:
     # Public API
     # ---------------------------------------------------------------
 
-    def generate(self, df: pd.DataFrame) -> np.ndarray:
+    def generate(
+        self,
+        df: pd.DataFrame,
+        labels: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Generate fixed-length sliding windows from synchronized telemetry.
+        Generate fixed-length sliding windows from synchronized telemetry
+        and its aligned dense channel-wise anomaly labels.
 
         Args:
             df: Synchronized multivariate telemetry. Must have a
                 DatetimeIndex, time-ordered rows, and one column per
                 telemetry channel. The DataFrame is never modified.
+            labels: Dense channel-wise anomaly labels of shape
+                ``(num_timestamps, num_channels)``, where
+                ``labels[t, c] == 1`` iff channel ``c`` is anomalous at
+                timestamp ``t``. Must have the same number of rows as
+                `df` (row ``t`` corresponds to ``df.index[t]``) and the
+                same number of columns as `df` (column ``c`` corresponds
+                to ``df.columns[c]``). Never modified. Labels are never
+                collapsed, aggregated, or reduced -- the full
+                per-timestamp, per-channel label tensor is windowed
+                exactly like the telemetry.
 
         Returns:
-            numpy.ndarray of shape
-                (number_of_windows, window_size, number_of_channels)
+            Tuple of ``(telemetry_windows, label_windows)``:
+                telemetry_windows : numpy.ndarray
+                    Shape ``(number_of_windows, window_size,
+                    number_of_channels)``.
+                label_windows : numpy.ndarray
+                    Shape ``(number_of_windows, window_size,
+                    number_of_channels)``, aligned index-for-index with
+                    `telemetry_windows` (i.e. `label_windows[i]` covers
+                    exactly the same timestamp range as
+                    `telemetry_windows[i]`).
 
             If drop_incomplete is False and the final window is
-            incomplete, it is padded with numpy.nan along the time axis.
+            incomplete, both the telemetry and label windows are padded
+            with numpy.nan along the time axis.
 
         Raises:
-            InvalidInputError: If `df` fails validation.
+            InvalidInputError: If `df` or `labels` fails validation, or
+                if their shapes are inconsistent with each other.
             InsufficientDataError: If no window can be produced from
                 the given data under the current configuration.
             WindowGenerationError: For any other window construction
                 failure.
         """
         self._validate_dataframe(df)
+        self._validate_labels(labels, df)
 
         total_rows = len(df)
         n_channels = df.shape[1]
@@ -132,6 +165,9 @@ class WindowGenerator:
             n_channels,
         )
 
+        telemetry_values = np.asarray(df.to_numpy(copy=False))
+        label_values = np.asarray(labels)
+
         if total_rows < self.window_size:
             if self.drop_incomplete:
                 raise InsufficientDataError(
@@ -139,30 +175,38 @@ class WindowGenerator:
                     f"window_size={self.window_size}; no complete window can "
                     f"be produced and drop_incomplete=True."
                 )
-            windows = self._generate_single_padded_window(df, n_channels)
-            logger.info("Generated %d window(s).", windows.shape[0])
-            return windows
+            telemetry_windows = self._generate_single_padded_window(
+                telemetry_values, total_rows, n_channels
+            )
+            label_windows = self._generate_single_padded_window(
+                label_values, total_rows, n_channels
+            )
+            logger.info("Generated %d window(s).", telemetry_windows.shape[0])
+            return telemetry_windows, label_windows
 
-        values = np.asarray(df.to_numpy(copy=False))
-
-        full_windows = self._generate_full_windows(values)
+        full_telemetry_windows = self._generate_full_windows(telemetry_values)
+        full_label_windows = self._generate_full_windows(label_values)
 
         if self.drop_incomplete:
-            windows = full_windows
+            telemetry_windows = full_telemetry_windows
+            label_windows = full_label_windows
         else:
-            windows = self._append_trailing_partial_window(
-                values, full_windows, total_rows, n_channels
+            telemetry_windows = self._append_trailing_partial_window(
+                telemetry_values, full_telemetry_windows, total_rows, n_channels
+            )
+            label_windows = self._append_trailing_partial_window(
+                label_values, full_label_windows, total_rows, n_channels
             )
 
-        if windows.shape[0] == 0:
+        if telemetry_windows.shape[0] == 0:
             raise InsufficientDataError(
                 f"No windows could be generated from {total_rows} row(s) with "
                 f"window_size={self.window_size}, stride={self.stride}, "
                 f"drop_incomplete={self.drop_incomplete}."
             )
 
-        logger.info("Generated %d window(s).", windows.shape[0])
-        return windows
+        logger.info("Generated %d window(s).", telemetry_windows.shape[0])
+        return telemetry_windows, label_windows
 
     # ---------------------------------------------------------------
     # Internal helpers: validation
@@ -225,6 +269,61 @@ class WindowGenerator:
             raise InvalidInputError(
                 f"df contains non-numeric column(s): {non_numeric}. All telemetry "
                 f"channel columns must be numeric."
+            )
+
+    @staticmethod
+    def _validate_labels(labels: np.ndarray, df: pd.DataFrame) -> None:
+        """
+        Validate the dense channel-wise label matrix against the
+        telemetry DataFrame it must align with.
+
+        Checks:
+            - `labels` is a numpy.ndarray
+            - `labels` is not empty
+            - `labels` has exactly 2 dimensions
+              (num_timestamps, num_channels)
+            - `labels` has a numeric dtype
+            - `labels` row count matches `df` row count (matching
+              telemetry/label lengths)
+            - `labels` column count matches `df` column count (matching
+              number of channels)
+
+        Raises:
+            InvalidInputError: If any of the above checks fail.
+        """
+        if not isinstance(labels, np.ndarray):
+            raise InvalidInputError(
+                f"labels must be a numpy.ndarray, got {type(labels).__name__}."
+            )
+
+        if labels.size == 0:
+            raise InvalidInputError("labels is empty; cannot generate windows.")
+
+        if labels.ndim != 2:
+            raise InvalidInputError(
+                "labels must have shape (num_timestamps, num_channels); "
+                f"got array with ndim={labels.ndim} and shape={labels.shape}."
+            )
+
+        if not np.issubdtype(labels.dtype, np.number):
+            raise InvalidInputError(
+                f"labels must have a numeric dtype, got dtype={labels.dtype}."
+            )
+
+        num_timestamps, num_channels = labels.shape
+
+        if num_timestamps != len(df):
+            raise InvalidInputError(
+                "labels and df must have the same number of timestamps "
+                f"(rows); got labels.shape[0]={num_timestamps} but "
+                f"len(df)={len(df)}."
+            )
+
+        if num_channels != df.shape[1]:
+            raise InvalidInputError(
+                "labels and df must have the same number of channels "
+                f"(columns); got labels.shape[1]={num_channels} but "
+                f"df.shape[1]={df.shape[1]}."
             )
 
     # ---------------------------------------------------------------
@@ -293,16 +392,17 @@ class WindowGenerator:
         return np.concatenate([full_windows, padded], axis=0)
 
     def _generate_single_padded_window(
-        self, df: pd.DataFrame, n_channels: int
+        self, values: np.ndarray, total_rows: int, n_channels: int
     ) -> np.ndarray:
         """
         Handle the edge case where total_rows < window_size and
         drop_incomplete=False: produce exactly one NaN-padded window
         containing all available rows.
-        """
-        values = np.asarray(df.to_numpy(copy=False))
-        total_rows = values.shape[0]
 
+        `values` has shape (total_rows, n_channels) and may correspond
+        to either the telemetry array or the dense label array; both are
+        padded identically so that the resulting windows remain aligned.
+        """
         padded = np.full((1, self.window_size, n_channels), np.nan, dtype=np.float64)
         padded[0, :total_rows, :] = values
         return padded

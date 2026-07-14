@@ -12,7 +12,7 @@ composing the previously implemented building blocks of the project:
 PhySATFormer itself contains no attention, pooling, or encoding logic of
 its own; it is strictly an orchestrator that wires these components
 together into a two-stage (channel-axis, then temporal-axis) Transformer
-classifier.
+for channel-level spatio-temporal anomaly localization.
 """
 
 import torch
@@ -26,15 +26,16 @@ from src.models.encoder_block import TransformerEncoderBlock
 
 
 class PhySATFormer(nn.Module):
-    """Physics-Guided Spatio-Temporal Transformer for telemetry classification.
+    """Physics-Guided Spatio-Temporal Transformer for telemetry anomaly localization.
 
     The model first embeds each scalar telemetry reading into a per-channel
     embedding, then applies a stack of physics-guided channel-attention
     blocks across the channel axis (independently per timestep), pools the
     channel dimension into a single per-timestep representation, injects
     temporal positional information, applies a stack of standard temporal
-    Transformer encoder blocks, mean-pools over the time axis, and finally
-    produces class logits via a linear classification head.
+    Transformer encoder blocks, and finally produces per-timestep,
+    per-channel anomaly logits via a linear prediction head applied
+    independently to every timestep.
 
     Parameters
     ----------
@@ -64,8 +65,9 @@ class PhySATFormer(nn.Module):
         Dimensionality of the feed-forward hidden layer within both the
         channel-attention blocks and the temporal Transformer encoder
         blocks. Must be positive.
-    num_classes : int
-        Number of output classes for classification. Must be positive.
+    num_channels : int
+        Number of telemetry channels for which the model predicts
+        per-timestep anomaly logits. Must be positive.
     physics_matrix : torch.Tensor
         Static, non-trainable channel-relationship matrix of shape
         ``(num_channels, num_channels)``, as produced by
@@ -93,8 +95,8 @@ class PhySATFormer(nn.Module):
         Stack of ``TransformerEncoderBlock`` modules applied across the
         temporal axis.
     classifier : nn.Linear
-        Linear layer mapping the pooled ``d_model`` representation to
-        ``num_classes`` logits.
+        Linear layer mapping the ``d_model`` representation at every
+        timestep to ``num_channels`` raw anomaly logits.
 
     Examples
     --------
@@ -109,13 +111,13 @@ class PhySATFormer(nn.Module):
     ...     num_channel_layers=2,
     ...     num_temporal_layers=2,
     ...     ff_dim=128,
-    ...     num_classes=5,
+    ...     num_channels=num_channels,
     ...     physics_matrix=physics_matrix,
     ... )
     >>> x = torch.randn(8, 32, num_channels)  # (batch, seq_len, channels)
     >>> logits = model(x)
     >>> logits.shape
-    torch.Size([8, 5])
+    torch.Size([8, 32, 5])
     """
 
     def __init__(
@@ -127,7 +129,7 @@ class PhySATFormer(nn.Module):
         num_channel_layers: int,
         num_temporal_layers: int,
         ff_dim: int,
-        num_classes: int,
+        num_channels: int,
         physics_matrix: torch.Tensor,
         dropout: float = 0.1,
     ) -> None:
@@ -177,11 +179,11 @@ class PhySATFormer(nn.Module):
             raise ValueError(f"ff_dim must be a positive int, got {ff_dim!r}")
         
         if (
-            not isinstance(num_classes, int)
-            or isinstance(num_classes, bool)
-            or num_classes <= 0
+            not isinstance(num_channels, int)
+            or isinstance(num_channels, bool)
+            or num_channels <= 0
         ):
-            raise ValueError(f"num_classes must be a positive int, got {num_classes!r}")
+            raise ValueError(f"num_channels must be a positive int, got {num_channels!r}")
         
         if not isinstance(physics_matrix, torch.Tensor):
             raise TypeError(
@@ -195,6 +197,13 @@ class PhySATFormer(nn.Module):
                 f"(num_channels, num_channels), got shape "
                 f"{tuple(physics_matrix.shape)}."
             )
+
+        if physics_matrix.shape[0] != num_channels:
+            raise ValueError(
+                "physics_matrix shape must match num_channels. Expected a "
+                f"({num_channels}, {num_channels}) matrix, got shape "
+                f"{tuple(physics_matrix.shape)}."
+            )
         
         if not 0.0 <= dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout!r}")
@@ -206,9 +215,8 @@ class PhySATFormer(nn.Module):
         self.num_channel_layers = num_channel_layers
         self.num_temporal_layers = num_temporal_layers
         self.ff_dim = ff_dim
-        self.num_classes = num_classes
         self.dropout_rate = dropout
-        self.num_channels = physics_matrix.shape[0]
+        self.num_channels = num_channels
 
         self.telemetry_channel_encoder = TelemetryChannelEncoder(
             channel_embedding_dim=channel_embedding_dim,
@@ -247,7 +255,7 @@ class PhySATFormer(nn.Module):
             ]
         )
 
-        self.classifier = nn.Linear(d_model, num_classes)
+        self.classifier = nn.Linear(d_model, num_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run a forward pass through the full PhySATFormer architecture.
@@ -263,7 +271,8 @@ class PhySATFormer(nn.Module):
         Returns
         -------
         torch.Tensor
-            Class logits of shape ``(batch_size, num_classes)``.
+            Raw (pre-sigmoid) per-timestep, per-channel anomaly logits
+            of shape ``(batch_size, sequence_length, num_channels)``.
 
         Raises
         ------
@@ -311,7 +320,10 @@ class PhySATFormer(nn.Module):
         for temporal_layer in self.temporal_layers:
             hidden = temporal_layer(hidden)
 
-        pooled = hidden.mean(dim=1)
-        logits = self.classifier(pooled)
+        # (B, T, d_model) -> (B, T, num_channels), applied independently
+        # to every timestep. No pooling, flattening, or aggregation over
+        # time or channels, and no activation: raw logits are returned
+        # for use with BCEWithLogitsLoss.
+        logits = self.classifier(hidden)
 
         return logits

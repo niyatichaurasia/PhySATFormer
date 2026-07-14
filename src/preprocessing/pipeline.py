@@ -3,10 +3,10 @@ src/preprocessing/pipeline.py
 
 TelemetryPipeline: orchestrates the complete preprocessing workflow for
 PhySATFormer. This module is a pure orchestrator -- it coordinates existing
-preprocessing components (TelemetryAssembler, WindowGenerator,
-TelemetryNormalizer, MissionDataset) and MUST NOT implement any
-preprocessing algorithms itself (no assembly, windowing, or normalization
-logic lives here).
+preprocessing components (TelemetryAssembler, IntervalLabelGenerator,
+WindowGenerator, TelemetryNormalizer, MissionDataset) and MUST NOT
+implement any preprocessing algorithms itself (no assembly, labeling,
+windowing, or normalization logic lives here).
 """
 
 from __future__ import annotations
@@ -15,9 +15,11 @@ import logging
 from typing import List, Tuple
 
 import numpy as np
+import pandas as pd
 
 from src.core.mission import Mission
 from src.preprocessing.assembler import TelemetryAssembler
+from src.preprocessing.interval_label_generator import IntervalLabelGenerator
 from src.preprocessing.window_generator import WindowGenerator
 from src.preprocessing.normalizer import TelemetryNormalizer
 from src.preprocessing.dataset import MissionDataset
@@ -32,8 +34,9 @@ class TelemetryPipeline:
         Mission
           -> TelemetryAssembler            (synchronize raw telemetry)
           -> chronological train/val/test split of synchronized telemetry
-          -> WindowGenerator                (produce sliding windows per split)
           -> TelemetryNormalizer            (fit on train, transform all)
+          -> IntervalLabelGenerator         (dense per-channel labels per split)
+          -> WindowGenerator                (sliding telemetry/label windows per split)
           -> MissionDataset objects
 
     This class contains no preprocessing algorithms of its own; it only
@@ -70,11 +73,12 @@ class TelemetryPipeline:
         self._assembler = TelemetryAssembler(
             direction=self.direction
         )
+        self._normalizer = TelemetryNormalizer(method=self.normalization_method)
+        self._label_generator = IntervalLabelGenerator()
         self._window_generator = WindowGenerator(
             window_size=self.window_size,
             stride=self.stride,
         )
-        self._normalizer = TelemetryNormalizer(method=self.normalization_method)
 
         logger.debug(
             "TelemetryPipeline initialized "
@@ -98,6 +102,14 @@ class TelemetryPipeline:
     ) -> Tuple[MissionDataset, MissionDataset, MissionDataset]:
         """
         Run the full preprocessing pipeline for a given mission.
+
+        Pipeline stages (in order): telemetry assembly (loading +
+        synchronization), optional development truncation, chronological
+        train/validation/test split, normalization (fit on train,
+        transform all splits), dense channel-wise label generation via
+        IntervalLabelGenerator on the normalized telemetry, and finally
+        sliding-window generation via WindowGenerator, which produces
+        aligned telemetry and label windows per split.
 
         Args:
             mission: Mission object to be preprocessed.
@@ -137,35 +149,58 @@ class TelemetryPipeline:
             synchronized_df
         )
 
-        train_windows = self._window_generator.generate(train_df)
-        validation_windows = self._window_generator.generate(validation_df)
-        test_windows = self._window_generator.generate(test_df)
+        self._normalizer.fit(train_df)
 
-        num_windows = len(train_windows) + len(validation_windows) + len(test_windows)
+        train_df = self._normalizer.transform(train_df)
+        validation_df = self._normalizer.transform(validation_df)
+        test_df = self._normalizer.transform(test_df)
+
+        train_labels = self._label_generator.generate(mission, train_df)
+        validation_labels = self._label_generator.generate(mission, validation_df)
+        test_labels = self._label_generator.generate(mission, test_df)
+
+        self._validate_telemetry_label_alignment(train_df, train_labels, "train")
+        self._validate_telemetry_label_alignment(
+            validation_df, validation_labels, "validation"
+        )
+        self._validate_telemetry_label_alignment(test_df, test_labels, "test")
+
+        train_telemetry_windows, train_label_windows = self._window_generator.generate(
+            train_df, train_labels
+        )
+        (
+            validation_telemetry_windows,
+            validation_label_windows,
+        ) = self._window_generator.generate(validation_df, validation_labels)
+        test_telemetry_windows, test_label_windows = self._window_generator.generate(
+            test_df, test_labels
+        )
+
+        num_windows = (
+            len(train_telemetry_windows)
+            + len(validation_telemetry_windows)
+            + len(test_telemetry_windows)
+        )
         logger.info(
             "Generated %d sliding windows (train=%d validation=%d test=%d)",
             num_windows,
-            len(train_windows),
-            len(validation_windows),
-            len(test_windows),
+            len(train_telemetry_windows),
+            len(validation_telemetry_windows),
+            len(test_telemetry_windows),
         )
 
-        self._normalizer.fit(train_windows)
-
-        train_windows = self._normalizer.transform(train_windows)
-        validation_windows = self._normalizer.transform(validation_windows)
-        test_windows = self._normalizer.transform(test_windows)
-
-        train_dataset = MissionDataset(train_windows)
-        validation_dataset = MissionDataset(validation_windows)
-        test_dataset = MissionDataset(test_windows)
+        train_dataset = MissionDataset(train_telemetry_windows, train_label_windows)
+        validation_dataset = MissionDataset(
+            validation_telemetry_windows, validation_label_windows
+        )
+        test_dataset = MissionDataset(test_telemetry_windows, test_label_windows)
 
         logger.info(
             "Pipeline build complete: total_windows=%d train=%d validation=%d test=%d",
             num_windows,
-            len(train_windows),
-            len(validation_windows),
-            len(test_windows),
+            len(train_telemetry_windows),
+            len(validation_telemetry_windows),
+            len(test_telemetry_windows),
         )
 
         return train_dataset, validation_dataset, test_dataset
@@ -177,9 +212,10 @@ class TelemetryPipeline:
         """
         Split the synchronized telemetry DataFrame chronologically into
         train/validation/test segments using train_ratio and
-        validation_ratio, BEFORE window generation. Windows are then
-        generated independently per segment so that no window straddles a
-        split boundary, preventing temporal data leakage between splits.
+        validation_ratio, BEFORE normalization, label generation, and
+        window generation. Windows are generated independently per
+        segment so that no window straddles a split boundary, preventing
+        temporal data leakage between splits.
         """
         num_samples = len(synchronized_df)
         if num_samples == 0:
@@ -207,6 +243,44 @@ class TelemetryPipeline:
             )
 
         return train_df, validation_df, test_df
+
+    @staticmethod
+    def _validate_telemetry_label_alignment(
+        telemetry_df: pd.DataFrame, labels: np.ndarray, split_name: str
+    ) -> None:
+        """
+        Validate that dense labels produced by IntervalLabelGenerator are
+        row-aligned with the normalized telemetry split they were
+        generated from, before handing both off to WindowGenerator.
+
+        This is a defensive orchestration-level check: it does not
+        implement any labeling or windowing logic itself, it only
+        guards against silently feeding misaligned telemetry/label pairs
+        into WindowGenerator, which would otherwise corrupt every
+        resulting window for the affected split.
+
+        Args:
+            telemetry_df: Normalized telemetry for a single split.
+            labels: Dense channel-wise labels generated for the same
+                split, expected shape (num_timestamps, num_channels).
+            split_name: Human-readable split identifier used in error
+                messages (e.g. "train", "validation", "test").
+
+        Raises:
+            ValueError: If the number of label rows does not match the
+                number of telemetry rows for this split.
+        """
+        num_telemetry_rows = len(telemetry_df)
+        num_label_rows = labels.shape[0] if labels.ndim > 0 else 0
+
+        if num_telemetry_rows != num_label_rows:
+            raise ValueError(
+                f"Telemetry/label row misalignment in '{split_name}' split: "
+                f"telemetry has {num_telemetry_rows} row(s) but "
+                f"IntervalLabelGenerator produced {num_label_rows} label "
+                f"row(s). Refusing to generate windows from misaligned "
+                f"telemetry and labels."
+            )
 
     @staticmethod
     def _validate_constructor_args(

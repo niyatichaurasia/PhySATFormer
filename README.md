@@ -1,122 +1,231 @@
 # PhySATFormer
 
-**Physics-Guided Transformer for Satellite Telemetry Anomaly Detection**
+<p align="center">
+  <b>Physics-Guided Spatio-Temporal Transformer for Satellite Telemetry Anomaly Detection</b>
+</p>
 
-PhySATFormer is a research-oriented framework for multivariate satellite telemetry anomaly detection using Transformer architectures enhanced with physics-guided attention mechanisms.
+<p align="center">
 
-The project is designed to provide a modular, reproducible pipeline for loading, preprocessing, modeling, and explaining satellite telemetry data.
+Research project implementing a novel Transformer architecture that incorporates spacecraft engineering knowledge into the attention mechanism for interpretable and physics-informed anomaly detection.
 
----
-
-## Features
-
-- Lazy loading of ESA Mission1 telemetry channels
-- Modular data ingestion pipeline
-- Multivariate telemetry synchronization
-- Sliding-window dataset generation
-- Channel-wise normalization
-- PyTorch dataset generation
-- Baseline Transformer (coming soon)
-- Physics-Guided Transformer (coming soon)
-- Explainable AI using SHAP and Attention Visualization (planned)
-- Ablation study support (planned)
+</p>
 
 ---
 
-## Repository Structure
+## Overview
 
+Satellite telemetry consists of hundreds of interdependent sensor measurements collected over time. Conventional Transformer architectures learn relationships between telemetry channels entirely from data, ignoring prior engineering knowledge already available from spacecraft design.
+
+**PhySATFormer** introduces a **Physics-Guided Channel Attention** mechanism that incorporates subsystem relationships directly into the attention computation before temporal sequence modeling.
+
+The proposed architecture separates learning into two complementary stages:
+
+- **Channel-level reasoning** using a physics-guided attention mechanism
+- **Temporal reasoning** using a Transformer encoder
+
+This design allows the model to leverage both **domain knowledge** and **long-range temporal dependencies** for anomaly detection.
+
+---
+
+# Overall Architecture
+
+<p align="center">
+
+*(Architecture figure will be added here)*
+
+</p>
+
+```text
+Raw Telemetry
+      │
+      ▼
+Telemetry Channel Encoder
+      │
+      ▼
+Physics-Guided Channel Attention
+      │
+      ▼
+Channel Attention Block
+      │
+      ▼
+Channel Pool
+      │
+      ▼
+Positional Encoding
+      │
+      ▼
+Transformer Encoder Stack
+      │
+      ▼
+Mean Pooling
+      │
+      ▼
+Classification Head
 ```
-PhySATFormer/
+
+---
+
+# Core Contributions
+
+- Physics-guided channel attention using subsystem relationship priors
+- Factorized spatio-temporal Transformer architecture
+- Modular Transformer implementation built from scratch in PyTorch
+- Memory-efficient preprocessing pipeline for large-scale satellite telemetry
+- Fully reproducible training and evaluation workflow
+- Explainability through attention visualization and SHAP analysis *(in progress)*
+
+---
+
+# Mathematical Formulation
+
+The mathematical derivation of the proposed Physics-Guided Attention mechanism is summarized below.
+
+<p align="center">
+
+**(Equation images will be inserted here)**
+
+</p>
+
+Recommended equations:
+
+- Channel Embedding
+- Query, Key and Value Projection
+- Standard Scaled Dot-Product Attention
+- Physics Relationship Matrix
+- Physics-Guided Attention
+- Attention Weight Computation
+- Context Vector
+- Mean Pooling
+- Classification Layer
+
+The complete derivation will also be included in the accompanying IEEE paper.
+
+---
+
+# Repository Structure
+
+```text
+physatformer/
 │
 ├── configs/
-├── docs/
+│   ├── dataset.yaml
+│   ├── model.yaml
+│   └── train.yaml
+│
+├── data/
+│   ├── raw/
+│   ├── processed/
+│   └── external/
+│
+├── checkpoints/
+├── logs/
+├── outputs/
+├── notebooks/
+├── paper/
+│
 ├── scripts/
+│   ├── run_all_tests.py
+│   └── test_day*.py
+│
 ├── src/
 │   ├── core/
-│   ├── data/
 │   ├── preprocessing/
 │   ├── models/
 │   ├── training/
 │   ├── evaluation/
 │   ├── explainability/
-│   ├── visualization/
 │   └── utils/
 │
-├── pyproject.toml
-├── requirements.txt
 ├── README.md
-└── LICENSE
+└── pyproject.toml
 ```
 
 ---
 
-## Current Progress
+# Features
 
-### Day 1 – Data Layer ✅
+### Dataset Pipeline
 
-- Mission
-- Channel
-- MetadataParser
-- ChannelLoader
-- ChannelInspector
+- ESA Mission abstraction
+- Lazy metadata loading
+- Multi-channel telemetry assembly
+- Telemetry inspection and analysis
 
-### Day 2 – Preprocessing ✅
+### Preprocessing
 
-- TelemetryAnalyzer
-- TelemetryAssembler
-- WindowGenerator
-- MissionDataset
-- TelemetryNormalizer
-- TelemetryPipeline
+- Sliding window generation
+- Chronological train / validation / test split
+- Memory-efficient normalization
+- PyTorch dataset generation
 
-### Upcoming
+### Models
 
 - Baseline Transformer
-- Physics-Guided Transformer
-- Training and Evaluation
-- Explainability
-- Ablation Study
+- Physics-Guided Channel Attention
+- Channel Attention Block
+- Physics Relationship Matrix
+- PhySATFormer
+
+### Engineering
+
+- Modular architecture
+- End-to-end integration tests
+- YAML-based configuration
+- Reproducible preprocessing pipeline
 
 ---
 
-## Dataset
+# Dataset
 
-This project uses the ESA Mission1 telemetry dataset.
+Current experiments use the **ESA Mission 1 Telemetry Dataset**.
 
-The dataset is **not included** in this repository because of its size.
+Expected directory structure:
 
-Configure the dataset location using a `.env` file.
-
-Example:
-
-```env
-PHYSATFORMER_DATASET=C:\Users\YourName\Datasets\Mission1
+```text
+Mission1/
+│
+├── channels.csv
+├── labels.csv
+├── anomaly_types.csv
+├── telecommands.csv
+└── telemetry/
 ```
 
-The default fallback location is:
-
-```
-data/raw/Mission1
-```
+Dataset locations are configured through the YAML configuration files.
 
 ---
 
-## Installation
+# Installation
 
-Clone the repository:
-
-```bash
-git clone https://github.com/niyatichaurasia/PhySATFormer.git
-cd PhySATFormer
-```
-
-Create a virtual environment and install dependencies:
+Clone the repository
 
 ```bash
-uv sync
+git clone https://github.com/<your-username>/physatformer.git
+
+cd physatformer
 ```
 
-or
+Create a virtual environment
+
+```bash
+python -m venv .venv
+```
+
+Activate
+
+Windows
+
+```powershell
+.venv\Scripts\activate
+```
+
+Linux / macOS
+
+```bash
+source .venv/bin/activate
+```
+
+Install dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -124,21 +233,9 @@ pip install -r requirements.txt
 
 ---
 
-## Running Tests
+# Running Integration Tests
 
-Day 1:
-
-```bash
-python -m scripts.test_day1
-```
-
-Day 2:
-
-```bash
-python -m scripts.test_day2
-```
-
-Run all:
+Run the complete integration suite
 
 ```bash
 python -m scripts.run_all_tests
@@ -146,28 +243,67 @@ python -m scripts.run_all_tests
 
 ---
 
-## Development Philosophy
+# Project Status
 
-- Single Responsibility Principle
-- Modular architecture
-- Research-quality implementation
-- Reproducible experiments
-- Temporal leakage prevention
-- No data leakage during preprocessing
-
----
-
-## Research Roadmap
-
-- Baseline Transformer
-- Physics-Guided Transformer
-- Training Pipeline
-- Explainability (SHAP + Attention)
-- Ablation Study
-- IEEE Paper
+| Component | Status |
+|------------|:------:|
+| Dataset Pipeline | ✅ |
+| Preprocessing Pipeline | ✅ |
+| Baseline Transformer | ✅ |
+| Physics-Guided Architecture | ✅ |
+| Training Pipeline | 🚧 |
+| Evaluation | 🚧 |
+| Explainability | 🚧 |
+| IEEE Paper | 🚧 |
 
 ---
 
-## License
+# Roadmap
 
-This project is licensed under the MIT License.
+- Train Baseline Transformer
+- Train PhySATFormer
+- Quantitative evaluation
+- Attention visualization
+- SHAP explainability
+- Ablation studies
+- IEEE conference submission
+
+---
+
+# Citation
+
+If you use this work in your research, please cite the forthcoming publication.
+
+```bibtex
+@article{physatformer2026,
+  title   = {PhySATFormer: Physics-Guided Spatio-Temporal Transformer for Satellite Telemetry Anomaly Detection},
+  author  = {Niyati Chaurasia},
+  journal = {Under Preparation},
+  year    = {2026}
+}
+```
+
+---
+
+# License
+
+This project is released under the MIT License.
+
+---
+
+# Author
+
+**Niyati Chaurasia**
+
+B.Tech Computer Science (Artificial Intelligence & Machine Learning)
+
+Manipal University Jaipur
+
+Research Interests
+
+- Physics-Informed AI
+- Deep Learning
+- Transformer Architectures
+- Explainable AI
+- Satellite Telemetry
+- Time-Series Modeling

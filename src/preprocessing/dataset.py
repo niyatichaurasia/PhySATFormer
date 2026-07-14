@@ -44,14 +44,16 @@ class MissionDataset(Dataset):
         containing telemetry windows. Must already be synchronized,
         normalized, and windowed by upstream preprocessing steps.
     labels : numpy.ndarray, optional
-        Array of length number_of_windows containing per-window labels.
-        If omitted, __getitem__ returns only the window tensor.
+        Array of shape (number_of_windows, window_size, number_of_channels)
+        containing per-window label windows, aligned with ``windows``.
+        If omitted, __getitem__ returns only the telemetry window tensor.
 
     Notes
     -----
     - Input arrays are never copied or modified during construction.
     - Conversion to torch.Tensor happens lazily, per-item, inside
-      __getitem__, preserving the original numpy dtype.
+      __getitem__. Telemetry and label windows are converted to
+      torch.float32.
     """
 
     def __init__(
@@ -96,11 +98,29 @@ class MissionDataset(Dataset):
             raise TypeError(
                 f"'labels' must be a numpy.ndarray, got {type(labels).__name__}."
             )
-        if len(labels) != windows.shape[0]:
+        if labels.ndim != 3:
             raise ValueError(
-                "'labels' length must match the number of windows: "
-                f"got len(labels)={len(labels)} but "
+                "'labels' must have exactly 3 dimensions "
+                "(number_of_windows, window_size, number_of_channels), "
+                f"got shape {labels.shape} with {labels.ndim} dimensions."
+            )
+        if labels.shape[0] != windows.shape[0]:
+            raise ValueError(
+                "'labels' number of windows must match 'windows': "
+                f"got labels.shape[0]={labels.shape[0]} but "
                 f"windows.shape[0]={windows.shape[0]}."
+            )
+        if labels.shape[1] != windows.shape[1]:
+            raise ValueError(
+                "'labels' window size must match 'windows': "
+                f"got labels.shape[1]={labels.shape[1]} but "
+                f"windows.shape[1]={windows.shape[1]}."
+            )
+        if labels.shape[2] != windows.shape[2]:
+            raise ValueError(
+                "'labels' number of channels must match 'windows': "
+                f"got labels.shape[2]={labels.shape[2]} but "
+                f"windows.shape[2]={windows.shape[2]}."
             )
 
     def __len__(self) -> int:
@@ -118,10 +138,10 @@ class MissionDataset(Dataset):
                 f"Index {index} out of range for dataset of length {len(self)}."
             )
 
-        window = torch.from_numpy(self.windows[index])
+        window = torch.from_numpy(self.windows[index]).to(torch.float32)
 
         if self.labels is None:
             return index, window
 
-        label = torch.from_numpy(np.asarray(self.labels[index]))
+        label = torch.from_numpy(self.labels[index]).to(torch.float32)
         return index, window, label
