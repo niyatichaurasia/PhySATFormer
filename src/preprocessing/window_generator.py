@@ -9,16 +9,43 @@ This module is strictly responsible for sequence (window) generation.
 It does not normalize, synchronize, interpolate, fill missing values,
 engineer features, collapse/aggregate labels, or perform any machine
 learning.
+
+MEMORY DESIGN
+==============
+For overlapping windows (stride < window_size, the common case),
+`num_windows` grows much faster than the number of underlying rows.
+Materializing every window into a single owned (num_windows,
+window_size, n_channels) array duplicates every row up to
+`window_size / stride` times. On Mission1 this produced ~229,976
+windows of shape (128, 76) -- ~16.7 GiB for a single array (telemetry
+*or* labels; both together is worse).
+
+`generate()` (eager, materializing) is kept for small missions,
+notebooks, and tests where convenience matters more than memory.
+
+`generate_lazy()` is the production-scale path: it performs the exact
+same validation and returns two `LazyWindowSet` objects instead of
+materialized arrays. A `LazyWindowSet` does not copy or view the
+overlapping window structure at all -- it stores only the underlying
+2D `(total_rows, n_channels)` array (whose memory footprint is
+independent of `stride` and typically orders of magnitude smaller than
+the windowed array) plus O(1) bookkeeping, and computes a single
+window, on demand, as an independent small copy in `__getitem__`.
+
+`LazyWindowSet` is intentionally a plain, indexable, `len()`-able
+sequence (duck-typed like a `Sequence[np.ndarray]`) so it is a drop-in
+replacement anywhere a materialized `(N, window_size, n_channels)`
+array was previously being indexed one window at a time -- most
+importantly, inside a `torch.utils.data.Dataset.__getitem__`.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Final, Tuple
+from typing import Final, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from numpy.lib.stride_tricks import sliding_window_view
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +68,180 @@ class InsufficientDataError(WindowGenerationError):
 
 
 # =========================================================================
+# LazyWindowSet
+# =========================================================================
+
+
+class LazyWindowSet(Sequence):
+    """
+    A memory-efficient, read-only, indexable sequence of fixed-length
+    sliding windows over a 2D `(total_rows, n_channels)` array.
+
+    No window is ever materialized until it is actually indexed, and
+    only the single requested window is materialized at that point --
+    never the full collection. This bounds peak extra memory to
+    `O(window_size * n_channels)` regardless of how many windows exist,
+    versus `O(num_windows * window_size * n_channels)` for an eagerly
+    materialized array.
+
+    Each `__getitem__` call returns an independently owned numpy array
+    (a fresh `.copy()` of just that one window). This is deliberate --
+    see "Why copy a single window?" below.
+
+    Why copy a single window?
+    --------------------------
+    An alternative zero-copy design would return a *view* into the
+    shared underlying array (e.g. via `numpy.lib.stride_tricks.
+    sliding_window_view`) for every window. That was rejected because
+    overlapping windows would then share the same underlying memory:
+    an in-place mutation to one window (e.g. a normalizer doing
+    `window *= scale` in place) would silently corrupt every other
+    window that overlaps the same source rows. Consumers would have to
+    uphold a fragile "never mutate in place" invariant across the
+    entire codebase (normalizer, augmentations, collation, etc.) to
+    stay correct. Copying a single window is cheap (tens of KB) and
+    removes that hazard entirely, while still avoiding the actual
+    memory blowup, which comes from materializing *all* windows at
+    once, not from copying one window at a time.
+
+    Not a numpy array: it does not support numpy fancy indexing,
+    broadcasting, or `.shape` on the whole collection. It supports
+    `len()`, integer indexing (`ws[i]`), and iteration, which is all a
+    `torch.utils.data.Dataset` or a manual training loop needs.
+    """
+
+    __slots__ = (
+        "_values",
+        "window_size",
+        "stride",
+        "n_channels",
+        "dtype",
+        "_num_full_windows",
+        "_has_padded_trailing_window",
+        "_trailing_start",
+        "_trailing_len",
+        "_num_windows",
+    )
+
+    def __init__(
+        self,
+        values: np.ndarray,
+        window_size: int,
+        stride: int,
+        num_full_windows: int,
+        has_padded_trailing_window: bool,
+        trailing_start: int,
+        trailing_len: int,
+    ) -> None:
+        """
+        Args:
+            values: The underlying, un-windowed `(total_rows,
+                n_channels)` array. Stored by reference (not copied);
+                this is the entire memory footprint of the
+                LazyWindowSet beyond a few scalars.
+            window_size: Length of each window along the time axis.
+            stride: Row offset between consecutive window starts.
+            num_full_windows: Number of complete, in-bounds windows
+                (i.e. windows requiring no NaN padding).
+            has_padded_trailing_window: Whether there is one
+                additional, NaN-padded trailing window beyond the full
+                windows (only possible when `drop_incomplete=False`).
+            trailing_start: Row index at which the trailing partial
+                window begins. Unused if `has_padded_trailing_window`
+                is False.
+            trailing_len: Number of real (non-padded) rows available
+                for the trailing partial window. Unused if
+                `has_padded_trailing_window` is False.
+        """
+        self._values = values
+        self.window_size = window_size
+        self.stride = stride
+        self.n_channels = values.shape[1]
+        self.dtype = values.dtype
+        self._num_full_windows = num_full_windows
+        self._has_padded_trailing_window = has_padded_trailing_window
+        self._trailing_start = trailing_start
+        self._trailing_len = trailing_len
+        self._num_windows = num_full_windows + (
+            1 if has_padded_trailing_window else 0
+        )
+
+    # ------------------------------------------------------------------
+    # Sequence protocol
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return self._num_windows
+
+    def __getitem__(self, idx: int) -> np.ndarray:
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(len(self)))]
+
+        n = len(self)
+        original_idx = idx
+        if idx < 0:
+            idx += n
+        if idx < 0 or idx >= n:
+            raise IndexError(
+                f"LazyWindowSet index {original_idx} out of range for "
+                f"{n} window(s)."
+            )
+
+        if idx < self._num_full_windows:
+            start = idx * self.stride
+            # Independent copy: see class docstring ("Why copy a
+            # single window?") for why this is required for safety.
+            return self._values[start : start + self.window_size].copy()
+
+        # The single, NaN-padded trailing window (drop_incomplete=False).
+        window = np.full(
+            (self.window_size, self.n_channels), np.nan, dtype=np.float64
+        )
+        remaining = self._values[
+            self._trailing_start : self._trailing_start + self._trailing_len
+        ]
+        window[: self._trailing_len, :] = remaining
+        return window
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def __repr__(self) -> str:
+        return (
+            f"LazyWindowSet(num_windows={len(self)}, "
+            f"window_size={self.window_size}, stride={self.stride}, "
+            f"n_channels={self.n_channels}, dtype={self.dtype})"
+        )
+
+    # ------------------------------------------------------------------
+    # Escape hatch
+    # ------------------------------------------------------------------
+
+    def materialize(self) -> np.ndarray:
+        """
+        Eagerly build the full `(num_windows, window_size, n_channels)`
+        array. Provided for parity with the legacy eager API, small
+        missions, and tests -- NOT recommended for production-scale
+        datasets, since this reintroduces the exact memory cost this
+        class exists to avoid.
+        """
+        logger.warning(
+            "LazyWindowSet.materialize() called: allocating a dense "
+            "(%d, %d, %d) array (%s). Prefer indexing the LazyWindowSet "
+            "lazily for large datasets.",
+            len(self),
+            self.window_size,
+            self.n_channels,
+            self.dtype,
+        )
+        out = np.empty((len(self), self.window_size, self.n_channels), dtype=np.float64)
+        for i in range(len(self)):
+            out[i] = self[i]
+        return out
+
+
+# =========================================================================
 # WindowGenerator
 # =========================================================================
 
@@ -56,11 +257,10 @@ class WindowGenerator:
           numeric) and the dense label matrix (matching shape).
         - Slide a fixed-size window of length `window_size` across the
           time axis, advancing by `stride` rows at a time.
-        - Return the resulting telemetry windows and label windows as two
-          numpy arrays, each of shape
-          (number_of_windows, window_size, number_of_channels), such that
-          every telemetry window corresponds exactly to the same
-          timestamp range in the label matrix.
+        - Return the resulting telemetry windows and label windows,
+          index-aligned, such that window `i` of the telemetry set
+          corresponds exactly to the same timestamp range as window `i`
+          of the label set.
 
     Explicitly NOT responsible for:
         - Normalization / scaling
@@ -98,56 +298,38 @@ class WindowGenerator:
         self.drop_incomplete: Final[bool] = drop_incomplete
 
     # ---------------------------------------------------------------
-    # Public API
+    # Public API: lazy (production-scale) path
     # ---------------------------------------------------------------
 
-    def generate(
+    def generate_lazy(
         self,
         df: pd.DataFrame,
         labels: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[LazyWindowSet, LazyWindowSet]:
         """
-        Generate fixed-length sliding windows from synchronized telemetry
-        and its aligned dense channel-wise anomaly labels.
+        Generate fixed-length sliding windows lazily: no
+        `(num_windows, window_size, n_channels)` array is ever
+        allocated. Use this for any dataset where `num_windows *
+        window_size * n_channels` would not comfortably fit in RAM.
 
         Args:
             df: Synchronized multivariate telemetry. Must have a
                 DatetimeIndex, time-ordered rows, and one column per
                 telemetry channel. The DataFrame is never modified.
             labels: Dense channel-wise anomaly labels of shape
-                ``(num_timestamps, num_channels)``, where
-                ``labels[t, c] == 1`` iff channel ``c`` is anomalous at
-                timestamp ``t``. Must have the same number of rows as
-                `df` (row ``t`` corresponds to ``df.index[t]``) and the
-                same number of columns as `df` (column ``c`` corresponds
-                to ``df.columns[c]``). Never modified. Labels are never
-                collapsed, aggregated, or reduced -- the full
-                per-timestamp, per-channel label tensor is windowed
-                exactly like the telemetry.
+                `(num_timestamps, num_channels)`, row/column-aligned
+                with `df`. Never modified.
 
         Returns:
-            Tuple of ``(telemetry_windows, label_windows)``:
-                telemetry_windows : numpy.ndarray
-                    Shape ``(number_of_windows, window_size,
-                    number_of_channels)``.
-                label_windows : numpy.ndarray
-                    Shape ``(number_of_windows, window_size,
-                    number_of_channels)``, aligned index-for-index with
-                    `telemetry_windows` (i.e. `label_windows[i]` covers
-                    exactly the same timestamp range as
-                    `telemetry_windows[i]`).
-
-            If drop_incomplete is False and the final window is
-            incomplete, both the telemetry and label windows are padded
-            with numpy.nan along the time axis.
+            Tuple of `(telemetry_windows, label_windows)`, each a
+            `LazyWindowSet` of length `number_of_windows`, index-aligned
+            with each other.
 
         Raises:
             InvalidInputError: If `df` or `labels` fails validation, or
                 if their shapes are inconsistent with each other.
             InsufficientDataError: If no window can be produced from
                 the given data under the current configuration.
-            WindowGenerationError: For any other window construction
-                failure.
         """
         self._validate_dataframe(df)
         self._validate_labels(labels, df)
@@ -156,8 +338,8 @@ class WindowGenerator:
         n_channels = df.shape[1]
 
         logger.info(
-            "Generating windows: total_rows=%d, window_size=%d, stride=%d, "
-            "drop_incomplete=%s, n_channels=%d",
+            "Generating windows (lazy): total_rows=%d, window_size=%d, "
+            "stride=%d, drop_incomplete=%s, n_channels=%d",
             total_rows,
             self.window_size,
             self.stride,
@@ -175,37 +357,114 @@ class WindowGenerator:
                     f"window_size={self.window_size}; no complete window can "
                     f"be produced and drop_incomplete=True."
                 )
-            telemetry_windows = self._generate_single_padded_window(
-                telemetry_values, total_rows, n_channels
+            # Exactly one NaN-padded window containing all available rows.
+            telemetry_windows = LazyWindowSet(
+                telemetry_values,
+                self.window_size,
+                self.stride,
+                num_full_windows=0,
+                has_padded_trailing_window=True,
+                trailing_start=0,
+                trailing_len=total_rows,
             )
-            label_windows = self._generate_single_padded_window(
-                label_values, total_rows, n_channels
+            label_windows = LazyWindowSet(
+                label_values,
+                self.window_size,
+                self.stride,
+                num_full_windows=0,
+                has_padded_trailing_window=True,
+                trailing_start=0,
+                trailing_len=total_rows,
             )
-            logger.info("Generated %d window(s).", telemetry_windows.shape[0])
+            logger.info("Generated %d window(s) (lazy).", len(telemetry_windows))
             return telemetry_windows, label_windows
 
-        full_telemetry_windows = self._generate_full_windows(telemetry_values)
-        full_label_windows = self._generate_full_windows(label_values)
+        num_full_windows = (total_rows - self.window_size) // self.stride + 1
+        last_full_start = (num_full_windows - 1) * self.stride
+        next_start = last_full_start + self.stride
 
-        if self.drop_incomplete:
-            telemetry_windows = full_telemetry_windows
-            label_windows = full_label_windows
-        else:
-            telemetry_windows = self._append_trailing_partial_window(
-                telemetry_values, full_telemetry_windows, total_rows, n_channels
-            )
-            label_windows = self._append_trailing_partial_window(
-                label_values, full_label_windows, total_rows, n_channels
-            )
+        has_padded_trailing_window = False
+        trailing_start = 0
+        trailing_len = 0
 
-        if telemetry_windows.shape[0] == 0:
+        if not self.drop_incomplete and next_start < total_rows:
+            remaining_len = total_rows - next_start
+            if remaining_len == self.window_size:
+                # A full window the stride selection didn't land on
+                # exactly (can happen when total_rows aligns evenly);
+                # counting it as "full" keeps behavior identical to
+                # the eager implementation, and no NaN padding is used.
+                num_full_windows += 1
+            else:
+                has_padded_trailing_window = True
+                trailing_start = next_start
+                trailing_len = remaining_len
+
+        telemetry_windows = LazyWindowSet(
+            telemetry_values,
+            self.window_size,
+            self.stride,
+            num_full_windows,
+            has_padded_trailing_window,
+            trailing_start,
+            trailing_len,
+        )
+        label_windows = LazyWindowSet(
+            label_values,
+            self.window_size,
+            self.stride,
+            num_full_windows,
+            has_padded_trailing_window,
+            trailing_start,
+            trailing_len,
+        )
+
+        if len(telemetry_windows) == 0:
             raise InsufficientDataError(
                 f"No windows could be generated from {total_rows} row(s) with "
                 f"window_size={self.window_size}, stride={self.stride}, "
                 f"drop_incomplete={self.drop_incomplete}."
             )
 
-        logger.info("Generated %d window(s).", telemetry_windows.shape[0])
+        logger.info("Generated %d window(s) (lazy).", len(telemetry_windows))
+        return telemetry_windows, label_windows
+
+    # ---------------------------------------------------------------
+    # Public API: eager (legacy / small-data / test) path
+    # ---------------------------------------------------------------
+
+    def generate(
+        self,
+        df: pd.DataFrame,
+        labels: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate fixed-length sliding windows, materialized eagerly as
+        dense `(number_of_windows, window_size, number_of_channels)`
+        numpy arrays.
+
+        WARNING -- memory: this allocates `number_of_windows *
+        window_size * number_of_channels` elements for telemetry, and
+        again for labels. When `stride < window_size` (overlapping
+        windows), this can be many times larger than the underlying
+        DataFrame. For production-scale datasets, use
+        `generate_lazy()` instead, which returns index-aligned
+        `LazyWindowSet` objects that never materialize more than one
+        window at a time.
+
+        This method is implemented in terms of `generate_lazy()`
+        followed by `LazyWindowSet.materialize()`, so both paths share
+        one validation/window-boundary implementation and always
+        produce identical windows in identical order.
+
+        Returns:
+            Tuple of `(telemetry_windows, label_windows)` as dense
+            numpy arrays. See `generate_lazy()` for argument and
+            validation details.
+        """
+        telemetry_lazy, label_lazy = self.generate_lazy(df, labels)
+        telemetry_windows = telemetry_lazy.materialize()
+        label_windows = label_lazy.materialize()
         return telemetry_windows, label_windows
 
     # ---------------------------------------------------------------
@@ -276,20 +535,6 @@ class WindowGenerator:
         """
         Validate the dense channel-wise label matrix against the
         telemetry DataFrame it must align with.
-
-        Checks:
-            - `labels` is a numpy.ndarray
-            - `labels` is not empty
-            - `labels` has exactly 2 dimensions
-              (num_timestamps, num_channels)
-            - `labels` has a numeric dtype
-            - `labels` row count matches `df` row count (matching
-              telemetry/label lengths)
-            - `labels` column count matches `df` column count (matching
-              number of channels)
-
-        Raises:
-            InvalidInputError: If any of the above checks fail.
         """
         if not isinstance(labels, np.ndarray):
             raise InvalidInputError(
@@ -325,84 +570,3 @@ class WindowGenerator:
                 f"(columns); got labels.shape[1]={num_channels} but "
                 f"df.shape[1]={df.shape[1]}."
             )
-
-    # ---------------------------------------------------------------
-    # Internal helpers: window construction
-    # ---------------------------------------------------------------
-
-    def _generate_full_windows(self, values: np.ndarray) -> np.ndarray:
-        """
-        Build all complete (fully in-bounds) windows using a strided,
-        zero-copy view over `values`, then select windows at the
-        requested stride.
-
-        `values` has shape (total_rows, n_channels).
-        Returns an array of shape (n_full_windows, window_size, n_channels).
-        """
-        # sliding_window_view over axis 0 yields shape:
-        # (total_rows - window_size + 1, n_channels, window_size)
-        view = sliding_window_view(values, self.window_size, axis=0)
-
-        # Select window start positions according to stride (zero-copy view).
-        strided_view = view[:: self.stride]
-
-        # Reorder axes to (n_windows, window_size, n_channels) and copy
-        # once here to produce a clean, contiguous, owned output array.
-        windows = np.transpose(strided_view, (0, 2, 1)).copy()
-        return windows
-
-    def _append_trailing_partial_window(
-        self,
-        values: np.ndarray,
-        full_windows: np.ndarray,
-        total_rows: int,
-        n_channels: int,
-    ) -> np.ndarray:
-        """
-        When drop_incomplete=False, check whether there is remaining data
-        past the last full window's start position (advanced by stride)
-        that does not fill a complete window, and if so, append it,
-        padded with NaN.
-        """
-        n_full_windows = full_windows.shape[0]
-
-        if n_full_windows == 0:
-            last_start = 0
-        else:
-            last_full_start = (n_full_windows - 1) * self.stride
-            last_start = last_full_start + self.stride
-
-        if last_start >= total_rows:
-            # No leftover rows to form a trailing partial window.
-            return full_windows
-
-        remaining = values[last_start:total_rows]
-        remaining_len = remaining.shape[0]
-
-        if remaining_len == self.window_size:
-            # Already a full window not caught by the stride selection
-            # (can occur when total_rows aligns exactly); include as-is.
-            padded = remaining[np.newaxis, ...]
-        else:
-            padded = np.full(
-                (1, self.window_size, n_channels), np.nan, dtype=np.float64
-            )
-            padded[0, :remaining_len, :] = remaining
-
-        return np.concatenate([full_windows, padded], axis=0)
-
-    def _generate_single_padded_window(
-        self, values: np.ndarray, total_rows: int, n_channels: int
-    ) -> np.ndarray:
-        """
-        Handle the edge case where total_rows < window_size and
-        drop_incomplete=False: produce exactly one NaN-padded window
-        containing all available rows.
-
-        `values` has shape (total_rows, n_channels) and may correspond
-        to either the telemetry array or the dense label array; both are
-        padded identically so that the resulting windows remain aligned.
-        """
-        padded = np.full((1, self.window_size, n_channels), np.nan, dtype=np.float64)
-        padded[0, :total_rows, :] = values
-        return padded

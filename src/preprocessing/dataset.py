@@ -1,147 +1,127 @@
 """
-dataset.py
+src/preprocessing/dataset.py
 
-PhySATFormer - src/preprocessing/dataset.py
+MissionDataset: a torch.utils.data.Dataset over a mission split's
+telemetry/label windows.
 
-Defines MissionDataset, a thin PyTorch Dataset wrapper around
-pre-computed telemetry windows (and optional labels).
+*** IMPORTANT NOTE ON PROVENANCE ***
+The original src/preprocessing/dataset.py was not provided alongside
+window_generator.py and pipeline.py, so this file is a reconstruction
+based strictly on MissionDataset's observable contract elsewhere in the
+codebase:
+  - architecture.md: "TelemetryPipeline ... Returns train_dataset,
+    val_dataset, test_dataset ... No DataLoaders."
+  - pipeline.py: `MissionDataset(telemetry_windows, label_windows)`
+  - train.py: instances are passed directly into `torch.utils.data.
+    DataLoader(...)`, which only requires `__len__` and `__getitem__`.
 
-Responsibilities of MissionDataset are strictly limited to:
-    - validating input shapes/types
-    - exposing __len__ and __getitem__
-    - lazily converting numpy arrays to torch tensors per-item
-
-MissionDataset MUST NOT:
-    - synchronize telemetry streams
-    - normalize / standardize data
-    - construct windows from raw sequences
-    - split data into train/val/test
-    - perform any modeling or learning logic
-
-All such responsibilities belong to other modules in the
-preprocessing pipeline.
+If your real MissionDataset already matches this contract (indexable +
+len()) and does *not* eagerly convert its constructor arguments to a
+torch.Tensor or numpy array up front (e.g. `self.data =
+torch.from_numpy(telemetry_windows)`), then plugging a LazyWindowSet
+into your existing MissionDataset unmodified should already work,
+since LazyWindowSet duck-types as the sequence MissionDataset was
+previously indexing. Please diff this file against yours rather than
+overwriting blindly -- it exists to make two specific behaviors
+explicit that the memory fix in window_generator.py / pipeline.py
+depends on:
+  1. Telemetry/label windows are only materialized when an index is
+     actually requested (never in __init__).
+  2. Normalization is applied to exactly one window at a time, inside
+     __getitem__, rather than to a fully materialized split.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-logger = logging.getLogger(__name__)
-
 
 class MissionDataset(Dataset):
-    """PyTorch Dataset exposing pre-computed telemetry windows.
+    """
+    A torch.utils.data.Dataset wrapping one split's (telemetry, label)
+    windows.
 
-    Parameters
-    ----------
-    windows : numpy.ndarray
-        Array of shape (number_of_windows, window_size, number_of_channels)
-        containing telemetry windows. Must already be synchronized,
-        normalized, and windowed by upstream preprocessing steps.
-    labels : numpy.ndarray, optional
-        Array of shape (number_of_windows, window_size, number_of_channels)
-        containing per-window label windows, aligned with ``windows``.
-        If omitted, __getitem__ returns only the telemetry window tensor.
+    `telemetry_windows` and `label_windows` may be either:
+      - a `LazyWindowSet` (preferred, production-scale: each window is
+        materialized on demand, one at a time), or
+      - a dense numpy array of shape `(num_windows, window_size,
+        num_channels)` (legacy/eager path, e.g. from
+        `WindowGenerator.generate()`, or in tests).
 
-    Notes
-    -----
-    - Input arrays are never copied or modified during construction.
-    - Conversion to torch.Tensor happens lazily, per-item, inside
-      __getitem__. Telemetry and label windows are converted to
-      torch.float32.
+    Both are accepted because both satisfy the same minimal contract
+    this class relies on: `len(x)` and `x[i] -> array-like of shape
+    (window_size, num_channels)`. No branching on the concrete type is
+    required or performed.
+
+    Args:
+        telemetry_windows: Index-aligned with `label_windows`. Windows
+            are NOT normalized in advance -- if `normalizer` is
+            provided, it is applied to exactly one window at a time,
+            inside `__getitem__`.
+        label_windows: Index-aligned with `telemetry_windows`. Never
+            normalized, regardless of `normalizer`.
+        normalizer: An already-fitted normalizer exposing
+            `.transform(array_like) -> array_like`, applied to a single
+            telemetry window's array at retrieval time. `transform` on
+            a per-channel affine normalizer is an elementwise
+            operation, so applying it one window at a time is
+            mathematically identical to applying it to a fully
+            materialized `(num_windows, window_size, num_channels)`
+            array -- it is simply never materialized. If `None`,
+            telemetry windows are returned unnormalized (useful for
+            tests or when normalization is handled elsewhere).
     """
 
     def __init__(
         self,
-        windows: np.ndarray,
-        labels: Optional[np.ndarray] = None,
+        telemetry_windows: Sequence[np.ndarray],
+        label_windows: Sequence[np.ndarray],
+        normalizer: Optional[object] = None,
     ) -> None:
-        self._validate_windows(windows)
-        if labels is not None:
-            self._validate_labels(windows, labels)
+        if len(telemetry_windows) != len(label_windows):
+            raise ValueError(
+                "telemetry_windows and label_windows must have the same "
+                f"length; got {len(telemetry_windows)} and "
+                f"{len(label_windows)}."
+            )
 
-        self.windows = windows
-        self.labels = labels
-
-        logger.info(
-            "MissionDataset created: num_windows=%d, window_size=%d, "
-            "num_channels=%d, has_labels=%s",
-            self.windows.shape[0],
-            self.windows.shape[1],
-            self.windows.shape[2],
-            self.labels is not None,
-        )
-
-    @staticmethod
-    def _validate_windows(windows: np.ndarray) -> None:
-        if not isinstance(windows, np.ndarray):
-            raise TypeError(
-                f"'windows' must be a numpy.ndarray, got {type(windows).__name__}."
-            )
-        if windows.ndim != 3:
-            raise ValueError(
-                "'windows' must have exactly 3 dimensions "
-                "(number_of_windows, window_size, number_of_channels), "
-                f"got shape {windows.shape} with {windows.ndim} dimensions."
-            )
-        if windows.shape[0] == 0:
-            raise ValueError("'windows' must contain at least one window.")
-
-    @staticmethod
-    def _validate_labels(windows: np.ndarray, labels: np.ndarray) -> None:
-        if not isinstance(labels, np.ndarray):
-            raise TypeError(
-                f"'labels' must be a numpy.ndarray, got {type(labels).__name__}."
-            )
-        if labels.ndim != 3:
-            raise ValueError(
-                "'labels' must have exactly 3 dimensions "
-                "(number_of_windows, window_size, number_of_channels), "
-                f"got shape {labels.shape} with {labels.ndim} dimensions."
-            )
-        if labels.shape[0] != windows.shape[0]:
-            raise ValueError(
-                "'labels' number of windows must match 'windows': "
-                f"got labels.shape[0]={labels.shape[0]} but "
-                f"windows.shape[0]={windows.shape[0]}."
-            )
-        if labels.shape[1] != windows.shape[1]:
-            raise ValueError(
-                "'labels' window size must match 'windows': "
-                f"got labels.shape[1]={labels.shape[1]} but "
-                f"windows.shape[1]={windows.shape[1]}."
-            )
-        if labels.shape[2] != windows.shape[2]:
-            raise ValueError(
-                "'labels' number of channels must match 'windows': "
-                f"got labels.shape[2]={labels.shape[2]} but "
-                f"windows.shape[2]={windows.shape[2]}."
-            )
+        # Stored by reference -- NOT converted to a torch.Tensor or a
+        # concatenated numpy array here. Doing so would materialize
+        # every window in the split up front, which is exactly the
+        # allocation this design avoids. Each window is only touched in
+        # __getitem__, on demand, one at a time.
+        self._telemetry_windows = telemetry_windows
+        self._label_windows = label_windows
+        self._normalizer = normalizer
 
     def __len__(self) -> int:
-        return self.windows.shape[0]
+        return len(self._telemetry_windows)
 
-    def __getitem__(
-        self, index: int
-    ) -> Union[Tuple[int, torch.Tensor], Tuple[int, torch.Tensor, torch.Tensor]]:
-        if not isinstance(index, (int, np.integer)):
-            raise TypeError(
-                f"Index must be an int, got {type(index).__name__}."
-            )
-        if index < 0 or index >= len(self):
-            raise IndexError(
-                f"Index {index} out of range for dataset of length {len(self)}."
-            )
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        telemetry_window = np.asarray(self._telemetry_windows[idx])
+        label_window = np.asarray(self._label_windows[idx])
 
-        window = torch.from_numpy(self.windows[index]).to(torch.float32)
+        if self._normalizer is not None:
+            # TelemetryNormalizer.transform() expects a batched array of
+            # shape (num_windows, window_size, num_channels). A single
+            # window is (window_size, num_channels), so we add a
+            # temporary leading batch dimension of size 1, transform,
+            # and then squeeze it back out -- semantics are identical
+            # to normalizing the whole split at once (see class
+            # docstring), just applied one window at a time.
+            batched_window = telemetry_window[np.newaxis, ...]
+            normalized_batch = self._normalizer.transform(batched_window)
+            telemetry_window = np.asarray(normalized_batch)[0]
 
-        if self.labels is None:
-            return index, window
+        telemetry_tensor = torch.as_tensor(
+            np.asarray(telemetry_window), dtype=torch.float32
+        )
+        label_tensor = torch.as_tensor(
+            np.asarray(label_window), dtype=torch.float32
+        )
 
-        label = torch.from_numpy(self.labels[index]).to(torch.float32)
-        return index, window, label
+        return telemetry_tensor, label_tensor

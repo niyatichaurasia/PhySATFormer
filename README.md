@@ -1,138 +1,121 @@
 # PhySATFormer
 
-**Physics-Guided Spatio-Temporal Transformer for Satellite Telemetry Anomaly Localization**
+> **Physics-Guided Spatio-Temporal Transformer for Channel-Level Telemetry Anomaly Localization**
 
-PhySATFormer is a physics-informed deep learning architecture for fine-grained anomaly localization in satellite telemetry. Unlike conventional time-series anomaly detectors that produce a single anomaly score for an entire sequence, PhySATFormer identifies **which telemetry channels are anomalous at each timestamp** by combining spacecraft subsystem knowledge with Transformer-based temporal modeling.
+PhySATFormer is a research framework for **spacecraft telemetry anomaly localization** using a **Physics-Guided Transformer**.
 
----
+Unlike conventional anomaly detectors that only determine whether a telemetry window is anomalous, PhySATFormer performs **fine-grained spatio-temporal localization**, identifying **which telemetry channels become anomalous and when**.
 
-## Motivation
-
-Satellite telemetry consists of hundreds of interdependent sensor channels. Faults rarely occur in isolation—they propagate across physically connected subsystems.
-
-Traditional Transformers learn these relationships solely from data.
-
-PhySATFormer incorporates **explicit physics priors** into the attention mechanism, allowing the model to reason about known subsystem relationships while simultaneously learning temporal fault evolution.
+The core contribution is the incorporation of **physics-based subsystem relationships** into the Transformer attention mechanism, allowing the model to exploit prior engineering knowledge during representation learning.
 
 ---
 
-## Key Features
+## Research Objective
 
-- Physics-guided channel attention
-- Spatio-temporal Transformer architecture
-- Channel-level anomaly localization
-- Physics relationship matrix integration
-- Modular preprocessing pipeline
-- Production-quality PyTorch implementation
-- Explainability-ready architecture
-- IEEE conference research implementation
+Given multivariate spacecraft telemetry,
+
+```
+Telemetry
+(batch, sequence_length, channels)
+```
+
+predict
+
+```
+Anomaly Labels
+(batch, sequence_length, channels)
+```
+
+where each prediction answers:
+
+> **"Is this telemetry channel anomalous at this timestep?"**
+
+This transforms anomaly detection into a **channel-level spatio-temporal localization** problem rather than a simple binary classification task.
 
 ---
 
 # Architecture
 
 ```
-Telemetry Window
-(B × T × C)
+Telemetry
+(B,T,C)
+
         │
         ▼
+
 Telemetry Channel Encoder
+
         │
         ▼
+
 Physics-Guided Channel Attention
+
         │
         ▼
-Channel Attention Block(s)
+
+Channel Attention Blocks
+
         │
         ▼
-Channel Pool
+
+Channel Pooling
+
         │
         ▼
-Positional Encoding
-        │
-        ▼
+
 Temporal Transformer Encoder
+
         │
         ▼
-Linear Prediction Head
+
+Prediction Head
+
         │
         ▼
-Channel-wise Anomaly Logits
-(B × T × C)
+
+Channel-Level Anomaly Logits
+(B,T,C)
 ```
 
 ---
 
-# Research Contribution
+# Key Features
 
-The primary contribution of PhySATFormer is the introduction of **Physics-Guided Channel Attention**, where spacecraft subsystem knowledge is injected directly into the attention mechanism using a fixed physics relationship matrix.
-
-Instead of learning channel relationships entirely from data, attention scores are biased according to known physical subsystem connectivity.
-
-For each attention head:
-
-\[
-S_h=\frac{Q_hK_h^{T}}{\sqrt{d_k}}+\lambda_hP
-\]
-
-where
-
-- \(Q,K\) are query and key matrices
-- \(P\) is the fixed physics relationship matrix
-- \(\lambda_h\) is a learnable scalar for attention head \(h\)
-
----
-
-# Prediction Objective
-
-Given a telemetry window
-
-\[
-X \in \mathbb{R}^{T\times C}
-\]
-
-the model predicts
-
-\[
-\hat{Y}\in\mathbb{R}^{T\times C}
-\]
-
-where
-
-\[
-\hat{Y}_{t,c}
-\]
-
-represents the anomaly logit for telemetry channel \(c\) at timestamp \(t\).
-
-Training uses **BCEWithLogitsLoss** for multi-label channel-wise anomaly localization.
+- Physics-guided channel attention
+- Transformer-based temporal modeling
+- Channel-level anomaly localization
+- Spatio-temporal predictions
+- Modular preprocessing pipeline
+- Reproducible experiment configuration
+- Training framework with checkpointing and early stopping
+- Explainability-ready architecture
 
 ---
 
 # Repository Structure
 
 ```
-PhySATFormer/
+physatformer/
 
 ├── configs/
-├── data/
-├── logs/
-├── notebooks/
-├── outputs/
-├── paper/
-├── scripts/
+│   ├── dataset.yaml
+│   ├── model.yaml
+│   └── train.yaml
 │
 ├── src/
 │   ├── core/
-│   ├── data/
-│   ├── evaluation/
-│   ├── explainability/
 │   ├── models/
 │   ├── preprocessing/
 │   ├── training/
+│   ├── explainability/
+│   ├── evaluation/
 │   └── utils/
 │
-├── tests/
+├── scripts/
+├── checkpoints/
+├── logs/
+├── outputs/
+├── paper/
 │
 ├── README.md
 ├── pyproject.toml
@@ -141,86 +124,180 @@ PhySATFormer/
 
 ---
 
+# Core Components
+
+## Preprocessing
+
+- Mission abstraction
+- Metadata parsing
+- Telemetry assembly
+- Normalization
+- Window generation
+- Interval label generation
+- Dataset construction
+
+---
+
+## Model
+
+The model consists of two stages.
+
+### Physics-Guided Channel Modeling
+
+Learns relationships between telemetry channels while incorporating prior subsystem knowledge through a Physics Relationship Matrix.
+
+### Temporal Modeling
+
+Models long-range temporal dependencies using Transformer encoder blocks after channel interactions have been aggregated.
+
+---
+
+# Physics Prior
+
+A Physics Relationship Matrix is constructed from spacecraft subsystem metadata.
+
+Instead of allowing every telemetry channel to attend equally, the model biases attention toward physically related channels.
+
+This embeds engineering knowledge directly into the attention mechanism while preserving end-to-end learning.
+
+---
+
+# Model Output
+
+PhySATFormer predicts
+
+```
+(batch_size,
+ sequence_length,
+ num_channels)
+```
+
+Each element is an independent anomaly prediction for one telemetry channel at one timestep.
+
+The model outputs **raw logits**, trained using **BCEWithLogitsLoss**.
+
+---
+
+# Training Pipeline
+
+The training framework includes
+
+- AdamW optimizer
+- Cosine Annealing learning rate scheduler
+- Gradient clipping
+- Early stopping
+- Model checkpointing
+- Automatic metric tracking
+
+---
+
+# Evaluation
+
+Performance is evaluated using
+
+- Precision
+- Recall
+- F1-score
+- Channel-wise Precision
+- Channel-wise Recall
+- Channel-wise F1
+
+The objective is not only to detect anomalies but also to accurately localize them across telemetry channels and time.
+
+---
+
+# Explainability
+
+The framework is designed to support post-hoc explainability through
+
+- Attention visualization
+- Channel importance analysis
+- Physics-guided attention inspection
+- SHAP-based explanations
+- Temporal attribution analysis
+
+---
+
+# Configuration
+
+Experiments are configured using YAML files.
+
+```
+configs/
+
+dataset.yaml
+
+model.yaml
+
+train.yaml
+```
+
+This enables reproducible experiments and straightforward hyperparameter tuning.
+
+---
+
+# Installation
+
+Clone the repository
+
+```bash
+git clone https://github.com/<username>/physatformer.git
+cd physatformer
+```
+
+Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+or
+
+```bash
+uv sync
+```
+
+---
+
+# Running Training
+
+```bash
+python train.py
+```
+
+---
+
 # Project Status
 
-| Stage | Status |
-|---------|--------|
-| Data Loading | ✅ |
-| Preprocessing Pipeline | ✅ |
-| Baseline Transformer | ✅ |
-| Physics-Guided Architecture | ✅ |
-| Training Pipeline | 🚧 |
-| Explainability | 🚧 |
-| Experiments | 🚧 |
-| IEEE Paper | 🚧 |
+Current implementation includes
+
+- Physics-guided Transformer architecture
+- Complete telemetry preprocessing pipeline
+- Modular training framework
+- Configuration-based experiment management
+
+Upcoming work includes
+
+- End-to-end training
+- Explainability module
+- Benchmark experiments
+- Ablation studies
+- IEEE paper figures and evaluation
 
 ---
 
-# Current Architecture
+# Research Contribution
 
-## Input
-
-```
-(B, T, C)
-```
-
-where
-
-- **B** = batch size
-- **T** = sequence length
-- **C** = telemetry channels
-
----
-
-## Output
-
-```
-(B, T, C)
-```
-
-Each output value represents the anomaly logit of one telemetry channel at one timestamp.
-
----
-
-# Dataset
-
-The implementation is designed around the ESA Mission 1 satellite telemetry dataset.
-
-The preprocessing pipeline performs
-
-- telemetry synchronization
-- normalization
-- interval-to-dense label generation
-- sliding-window generation
-- PyTorch dataset creation
-
----
-
-# Technology Stack
-
-- Python
-- PyTorch
-- NumPy
-- Pandas
-- scikit-learn
-- Matplotlib
-- SHAP
-- Ruff
-
----
-
-# Roadmap
-
-- Physics-Guided Channel Attention
-- Temporal Transformer
-- Spatio-Temporal Anomaly Localization
-- Training Framework
-- Explainability (Attention + SHAP)
-- Ablation Studies
-- IEEE Conference Paper
+PhySATFormer introduces a **physics-guided attention mechanism** for multivariate spacecraft telemetry, combining prior subsystem knowledge with Transformer-based sequence modeling to achieve **channel-level spatio-temporal anomaly localization**.
 
 ---
 
 # License
 
-This repository is intended for academic and research purposes.
+This project is released under the MIT License.
+
+---
+
+# Citation
+
+If you use this repository in your research, please cite the accompanying paper (to be released).

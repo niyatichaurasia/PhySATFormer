@@ -3,6 +3,7 @@
 import torch
 
 from src.core.mission import Mission
+from src.utils.constants import SUBSYSTEM_COLUMN
 
 
 class PhysicsRelationshipMatrix:
@@ -27,18 +28,27 @@ class PhysicsRelationshipMatrix:
         """
         Extract the subsystem label for each channel from the metadata
         DataFrame exposed by the Mission object.
+
+        The column name is not hardcoded here; it is sourced from
+        `SUBSYSTEM_COLUMN` in `src.utils.constants`, the single place
+        that defines the mapping between the raw metadata schema and
+        the fields this codebase depends on. This keeps the contract
+        in sync with `CHANNELS_REQUIRED_COLUMNS`, which is validated
+        at ingestion time in `MetadataParser.parse_channels()`.
         """
         channels = self.mission.channels
         if channels.empty:
             raise ValueError("Mission contains no channel metadata.")
 
-        if "subsystem" not in channels.columns:
+        if SUBSYSTEM_COLUMN not in channels.columns:
             raise KeyError(
-                "Mission.channels DataFrame does not contain a "
-                "'subsystem' column."
+                "Mission.channels DataFrame does not contain the "
+                f"'{SUBSYSTEM_COLUMN}' column (see "
+                "src.utils.constants.SUBSYSTEM_COLUMN). Found columns: "
+                f"{list(channels.columns)}"
             )
 
-        return channels["subsystem"].tolist()
+        return channels[SUBSYSTEM_COLUMN].tolist()
 
     def build(self) -> torch.FloatTensor:
         subsystems = self._get_channel_subsystems()
@@ -59,7 +69,7 @@ class PhysicsRelationshipMatrix:
                     matrix[i, j] = 0.0
 
         return matrix
-    
+
     @property
     def num_channels(self) -> int:
         """Return the number of telemetry channels."""
