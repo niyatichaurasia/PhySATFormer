@@ -52,6 +52,7 @@ from src.utils.constants import CHANNEL_ID_COLUMN
 # =============================================================================
 
 from src.models.physatformer import PhySATFormer
+from src.models.baseline_transformer import BaselineTransformer
 from src.training.optimizer import OptimizerFactory
 from src.training.scheduler import SchedulerFactory
 from src.training.losses import PhySATLoss
@@ -658,25 +659,16 @@ def build_model(
     physics_matrix: torch.FloatTensor,
     device: torch.device,
     logger: logging.Logger,
-) -> PhySATFormer:
-    """Instantiate PhySATFormer from model.yaml and move it to `device`.
+) -> torch.nn.Module:
+    """Instantiate the selected model from model.yaml and move it to `device`.
 
-    Delegates entirely to the existing `PhySATFormer` constructor; no
-    model logic is implemented here.
+    Supports:
+        - PhySATFormer
+        - BaselineTransformer
 
-    Args:
-        model_cfg: Parsed contents of ``model.yaml``.
-        physics_matrix: Physics relationship matrix built in Module 6.
-        device: The resolved compute device.
-        logger: Project logger used to report progress.
-
-    Returns:
-        PhySATFormer: The constructed model, moved to `device`.
-
-    Raises:
-        KeyError: If any required model configuration key is missing or
-            ``None`` in ``model_cfg``.
+    The model is selected using the `model_type` field in model.yaml.
     """
+
     required_keys = (
         "input_dim",
         "channel_embedding_dim",
@@ -687,38 +679,63 @@ def build_model(
         "ff_dim",
         "num_channels",
     )
+
     missing_keys = [
         key for key in required_keys
         if key not in model_cfg or model_cfg[key] is None
     ]
+
     if missing_keys:
         raise KeyError(
             f"Missing required model configuration key(s): {missing_keys}. "
             "Please specify them in model.yaml."
         )
 
-    logger.info("Building PhySATFormer model...")
+    model_type = model_cfg.get("model_type", "physatformer").lower()
 
-    model = PhySATFormer(
-        input_dim=model_cfg["input_dim"],
-        channel_embedding_dim=model_cfg["channel_embedding_dim"],
-        d_model=model_cfg["d_model"],
-        num_heads=model_cfg["num_heads"],
-        num_channel_layers=model_cfg["num_channel_layers"],
-        num_temporal_layers=model_cfg["num_temporal_layers"],
-        ff_dim=model_cfg["ff_dim"],
-        num_channels=model_cfg["num_channels"],
-        physics_matrix=physics_matrix,
-        dropout=model_cfg.get("dropout", 0.1),
-    )
+    logger.info("Building model: %s", model_type)
+
+    if model_type == "physatformer":
+
+        model = PhySATFormer(
+            input_dim=model_cfg["input_dim"],
+            channel_embedding_dim=model_cfg["channel_embedding_dim"],
+            d_model=model_cfg["d_model"],
+            num_heads=model_cfg["num_heads"],
+            num_channel_layers=model_cfg["num_channel_layers"],
+            num_temporal_layers=model_cfg["num_temporal_layers"],
+            ff_dim=model_cfg["ff_dim"],
+            num_channels=model_cfg["num_channels"],
+            physics_matrix=physics_matrix,
+            dropout=model_cfg.get("dropout", 0.1),
+        )
+
+    elif model_type == "baseline":
+
+        model = BaselineTransformer(
+            input_dim=model_cfg["input_dim"],
+            channel_embedding_dim=model_cfg["channel_embedding_dim"],
+            d_model=model_cfg["d_model"],
+            num_heads=model_cfg["num_heads"],
+            num_channel_layers=model_cfg["num_channel_layers"],
+            num_temporal_layers=model_cfg["num_temporal_layers"],
+            ff_dim=model_cfg["ff_dim"],
+            num_channels=model_cfg["num_channels"],
+            dropout=model_cfg.get("dropout", 0.1),
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported model_type '{model_type}'. "
+            "Supported values are: 'physatformer', 'baseline'."
+        )
+
     model = model.to(device)
 
     logger.info(
-        "PhySATFormer built and moved to device=%s "
-        "(num_channels=%s, d_model=%s)",
+        "%s built successfully and moved to %s",
+        model.__class__.__name__,
         device,
-        model_cfg["num_channels"],
-        model_cfg["d_model"],
     )
 
     return model

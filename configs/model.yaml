@@ -22,3 +22,5 @@ ff_dim: 512
 
 # Regularization
 dropout: 0.1
+
+model_type: baseline
