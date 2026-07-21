@@ -70,12 +70,30 @@ class ChannelLoader:
                 pandas DataFrame.
         """
         channel_name = self._get_channel_name(metadata)
+        '''
         archive_path = self._resolve_archive_path(channel_name)
 
         logger.debug("Loading channel '%s' from %s", channel_name, archive_path)
 
         pickle_bytes = self._read_pickle_bytes_from_archive(archive_path)
         obj = self._deserialize_pickle(pickle_bytes, archive_path)
+        '''
+        archive_path = self._resolve_archive_path(channel_name)
+
+        logger.debug("Loading channel '%s' from %s", channel_name, archive_path)
+
+        if archive_path.suffix == ".zip":
+            pickle_bytes = self._read_pickle_bytes_from_archive(archive_path)
+            obj = self._deserialize_pickle(pickle_bytes, archive_path)
+        else:
+            try:
+                with open(archive_path, "rb") as fh:
+                    obj = pickle.load(fh)
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to load telemetry pickle '{archive_path}': {exc}"
+                ) from exc
+
 
         if not isinstance(obj, pd.DataFrame):
             raise ValueError(
@@ -113,7 +131,7 @@ class ChannelLoader:
             ) from exc
 
         return str(channel_name)
-
+    '''
     def _resolve_archive_path(self, channel_name: str) -> Path:
         """Resolves the path to a channel's ZIP archive.
 
@@ -135,6 +153,32 @@ class ChannelLoader:
             )
 
         return archive_path
+    '''
+    def _resolve_archive_path(self, channel_name: str) -> Path:
+        """Resolve the path to a channel telemetry file.
+
+        Supports both:
+            channels/channel_1.zip      (original dataset)
+            channels/channel_1          (already-extracted pickle)
+        """
+
+        channels_dir = self.root / CHANNELS_DIRECTORY
+
+        zip_path = channels_dir / f"{channel_name}.zip"
+        if zip_path.exists():
+            return zip_path
+
+        pickle_path = channels_dir / channel_name
+        if pickle_path.exists():
+            return pickle_path
+
+        raise FileNotFoundError(
+            f"Telemetry data not found for channel '{channel_name}'. "
+            f"Checked:\n"
+            f"  {zip_path}\n"
+            f"  {pickle_path}"
+        )
+
 
     @staticmethod
     def _read_pickle_bytes_from_archive(archive_path: Path) -> bytes:
