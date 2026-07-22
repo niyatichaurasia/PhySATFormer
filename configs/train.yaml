@@ -22,7 +22,7 @@ early_stopping:
   patience: 10
   min_delta: 0.001
 
-checkpoint_dir: checkpoints/baseline
+checkpoint_dir: checkpoints/physatformer
 
 num_workers: 0
 shuffle: true
