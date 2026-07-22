@@ -72,11 +72,11 @@ logs/
 # -----------------------
 # Model Checkpoints
 # -----------------------
-checkpoints/
-*.ckpt
-*.pth
-*.pt
-*.onnx
+#checkpoints/
+#*.ckpt
+#*.pth
+#*.pt
+#*.onnx
 
 # -----------------------
 # Generated Outputs
