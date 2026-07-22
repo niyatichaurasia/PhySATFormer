@@ -1013,7 +1013,7 @@ def resume_checkpoint(
         logger: Project logger used to report progress.
     """
     if resume_path is None:
-        return
+        return 0
 
     logger.info("Resuming from checkpoint: %s", resume_path)
 
@@ -1025,14 +1025,19 @@ def resume_checkpoint(
         device=trainer.device,
     )
 
+    best_metric = metadata.get("metric")
+
+    if best_metric is not None:
+        trainer.set_best_validation_f1(best_metric)
+
     logger.info(
-        "Checkpoint restored: epoch=%s metric=%s "
-        "(training will still start counting from epoch 1; "
-        "Trainer.fit() has no start_epoch parameter)",
+        "Checkpoint restored: epoch=%s metric=%s. Resuming training from epoch %s.",
         metadata.get("epoch"),
         metadata.get("metric"),
+        metadata.get("epoch", 0) + 1,
     )
 
+    return metadata.get("epoch", 0)
 
 # =============================================================================
 # Module 12: Main
@@ -1120,7 +1125,13 @@ def main() -> None:
         logger=logger,
     )
 
-    resume_checkpoint(args.resume, trainer, logger)
+    last_epoch = resume_checkpoint(
+        args.resume,
+        trainer,
+        logger,
+    )
+
+    start_epoch = last_epoch + 1
 
     if "epochs" not in train_cfg or train_cfg["epochs"] is None:
         raise KeyError("Missing required training configuration key: 'epochs'.")
@@ -1130,6 +1141,7 @@ def main() -> None:
         train_loader=train_loader,
         validation_loader=validation_loader,
         num_epochs=train_cfg["epochs"],
+        start_epoch=start_epoch,
     )
 
     final_checkpoint_path = trainer.checkpoint_manager.save_checkpoint(

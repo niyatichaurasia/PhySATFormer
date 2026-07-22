@@ -368,8 +368,12 @@ class Trainer:
         self.model.train()
         accumulator = self._MetricAccumulator(self.metrics)
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx % 2000 == 0:
+                print(f"Batch {batch_idx}/{len(train_loader)}")
+
             batch_loss, batch_metrics = self._training_step(batch)
+
             accumulator.update(batch_loss, batch_metrics)
 
         return accumulator.compute()
@@ -480,12 +484,19 @@ class Trainer:
     # ------------------------------------------------------------------ #
     # Top-level training loop
     # ------------------------------------------------------------------ #
+    def set_best_validation_f1(self, best_val_f1: float) -> None:
+        """
+        Restore the best validation F1 from a checkpoint when resuming training.
+        """
+        self._best_val_f1 = best_val_f1
+
 
     def fit(
         self,
         train_loader: DataLoader,
         validation_loader: DataLoader,
         num_epochs: int,
+        start_epoch: int = 1,
     ) -> Dict[str, List[float]]:
         """
         Run the full training loop for up to `num_epochs` epochs.
@@ -518,7 +529,7 @@ class Trainer:
 
         history = self._init_history()
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(start_epoch, num_epochs + 1):
             self.model.train()
             train_metrics = self.train_epoch(train_loader)
 
