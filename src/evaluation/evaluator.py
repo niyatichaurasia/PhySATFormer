@@ -104,25 +104,47 @@ class Evaluator:
                 named).
 
         Returns:
-            The checkpoint metadata dict returned by
-            `CheckpointManager.load_checkpoint` (contains at least
-            `"epoch"` and `"metric"`).
+            The checkpoint metadata dict (contains at least `"epoch"`
+            and `"metric"`, when present in the checkpoint file).
+
+        Note:
+            This intentionally does NOT call
+            `CheckpointManager.load_checkpoint(...)` with
+            `optimizer=None, scheduler=None`. Every other call site in
+            the codebase (`train.py`'s `resume_checkpoint`) always
+            passes real, already-constructed optimizer/scheduler
+            instances, so it is unverified whether
+            `CheckpointManager.load_checkpoint` tolerates `None` for
+            those arguments (e.g. it may unconditionally call
+            `optimizer.load_state_dict(...)`). Since evaluation only
+            ever needs the model's weights, the checkpoint file is
+            loaded directly here and only `model_state_dict` is
+            restored, without exercising that code path at all.
         """
         import pathlib
 
-        checkpoint_dir = pathlib.Path(checkpoint_path).parent
-        manager = CheckpointManager(checkpoint_dir)
-        metadata = manager.load_checkpoint(
-            checkpoint_path=checkpoint_path,
-            model=self.model,
-            optimizer=None,
-            scheduler=None,
-            device=self.device,
-        )
-        self._checkpoint_manager = manager
+        resolved_path = pathlib.Path(checkpoint_path)
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"Checkpoint file not found: '{resolved_path}'.")
+
+        checkpoint = torch.load(resolved_path, map_location=self.device)
+
+        if "model_state_dict" not in checkpoint:
+            raise ValueError(
+                f"Checkpoint '{resolved_path}' does not contain a "
+                "'model_state_dict' key."
+            )
+
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        metadata = {
+            "epoch": checkpoint.get("epoch"),
+            "metric": checkpoint.get("metric") or checkpoint.get("best_metric"),
+        }
+
         logger.info(
             "Loaded checkpoint '%s' (epoch=%s, metric=%s).",
-            checkpoint_path,
+            resolved_path,
             metadata.get("epoch"),
             metadata.get("metric"),
         )

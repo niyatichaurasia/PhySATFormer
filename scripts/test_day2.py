@@ -1,5 +1,6 @@
 """Day 2 integration test."""
 
+from src.core import mission
 from src.utils.constants import MISSION_ROOT
 from src.core.mission import Mission
 from src.preprocessing.pipeline import TelemetryPipeline
@@ -22,7 +23,8 @@ def main() -> None:
         random_seed=42,
         direction="nearest",
     )
-
+    print(mission.labels.head())
+    print(len(mission.labels))
     train_dataset, validation_dataset, test_dataset = pipeline.build(
         mission=mission,
         channel_ids=[1, 2, 3],
