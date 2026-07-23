@@ -27,11 +27,10 @@ before running:
      swap in your project's actual config-loading utility if it differs
      (e.g. if it does env-var interpolation, validation, or merges CLI
      overrides).
-  2. `Mission` construction: architecture.md shows `TelemetryPipeline
-     .build(mission, channel_ids, max_rows)` taking a `Mission` object,
-     but I don't have `src/core/mission.py`. I've assumed
-     `Mission.from_config(...)` / a `mission_path` config key -- adjust
-     to however your `train.py` actually constructs its `Mission`.
+  2. `Mission` construction: RESOLVED. `Mission` is a dataclass whose
+     only field is `root: Path` (see `src/core/mission.py`), so this
+     script now builds it the same way `train.py`'s `build_mission()`
+     does: `Mission(root=pathlib.Path(dataset_config["root"]))`.
   3. `PhysicsMatrixBuilder` / `PhysicsRelationshipMatrix`: the class name
      differs between architecture.md (`PhysicsMatrixBuilder`) and your
      prompt (`PhysicsRelationshipMatrix`). I've assumed the latter,
@@ -68,6 +67,7 @@ from src.models.physics_matrix import (  # ASSUMPTION: see note above
     PhysicsRelationshipMatrix,
 )
 from src.preprocessing.pipeline import TelemetryPipeline
+from src.utils.constants import CHANNEL_ID_COLUMN
 from src.utils.results_dirs import ensure_results_directories
 
 logging.basicConfig(
@@ -148,10 +148,7 @@ def main() -> None:
     device = _resolve_device(train_config.get("device", "auto"))
     logger.info("Using device: %s", device)
 
-    # ASSUMPTION: adjust to however your train.py actually builds a
-    # Mission (e.g. a fixed mission id, a path in dataset.yaml, a CLI
-    # flag). Kept as a config key here for symmetry with train.py.
-    mission = Mission.from_config(dataset_config)
+    mission = Mission(root=pathlib.Path(dataset_config["root"]))
 
     pipeline = TelemetryPipeline(
         window_size=dataset_config["window_size"],
@@ -162,9 +159,23 @@ def main() -> None:
         random_seed=dataset_config["random_seed"],
         direction=dataset_config["direction"],
     )
+
+    # Same channel_ids construction as train.py's build_datasets(): derive
+    # from Mission metadata rather than from dataset.yaml (dataset.yaml
+    # has no channel_ids key, which was causing an empty list to reach
+    # TelemetryAssembler.assemble()).
+    channels = mission.channels
+    if CHANNEL_ID_COLUMN not in channels.columns:
+        raise KeyError(
+            f"Mission.channels DataFrame does not contain the expected "
+            f"'{CHANNEL_ID_COLUMN}' column; cannot determine channel_ids "
+            "for pipeline construction."
+        )
+    channel_ids = channels[CHANNEL_ID_COLUMN].tolist()
+
     _, _, test_dataset = pipeline.build(
         mission=mission,
-        channel_ids=dataset_config.get("channel_ids", []),
+        channel_ids=channel_ids,
         max_rows=dataset_config.get("max_rows"),
     )
 
