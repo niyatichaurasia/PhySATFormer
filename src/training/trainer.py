@@ -81,6 +81,13 @@ class Trainer:
         gradient_clip_value: Maximum gradient norm used for gradient
             clipping. Defaults to 1.0. Set to a non-positive value to
             disable clipping.
+        amp_enabled: Whether automatic mixed precision (autocast +
+            GradScaler) is active for this run. Resolved to `False`
+            whenever `device.type != "cuda"`, regardless of the value
+            passed in.
+        scaler: The `torch.cuda.amp.GradScaler` instance used to scale
+            losses/gradients when `amp_enabled` is `True`, otherwise
+            `None`.
     """
 
     def __init__(
@@ -94,6 +101,8 @@ class Trainer:
         early_stopping: EarlyStopping,
         device: torch.device | str,
         gradient_clip_value: float = 1.0,
+        amp_enabled: bool = False,
+        scaler: "torch.cuda.amp.GradScaler | None" = None,
     ) -> None:
         self._validate_constructor_args(
             model=model,
@@ -116,6 +125,12 @@ class Trainer:
         self.checkpoint_manager = checkpoint_manager
         self.early_stopping = early_stopping
         self.gradient_clip_value = gradient_clip_value
+
+        # AMP is opt-in and defaults to off, preserving prior behavior
+        # for any caller that does not pass these arguments. It is only
+        # ever active on CUDA devices.
+        self.amp_enabled = bool(amp_enabled) and self.device.type == "cuda"
+        self.scaler = scaler if self.amp_enabled else None
 
         # Tracks the best validation F1 observed so far, used to decide
         # whether a new checkpoint should be saved.
@@ -308,17 +323,29 @@ class Trainer:
         inputs = self._move_to_device(inputs)
         targets = self._move_to_device(targets)
 
-        self.optimizer.zero_grad()
+        # set_to_none=True avoids zeroing gradient memory explicitly;
+        # the next backward() populates gradients identically either way.
+        self.optimizer.zero_grad(set_to_none=True)
 
-        predictions = self.model(inputs)
-        loss = self.loss_fn(predictions, targets)
+        # No-op context (enabled=False) when AMP is off, so the forward
+        # pass and loss computation are unchanged from before in that case.
+        with torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+            predictions = self.model(inputs)
+            loss = self.loss_fn(predictions, targets)
 
-        loss.backward()
-        self._clip_gradients()
-        self.optimizer.step()
+        if self.amp_enabled:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            self._clip_gradients()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self._clip_gradients()
+            self.optimizer.step()
 
         with torch.no_grad():
-            batch_metrics = self.metrics(predictions.detach(), targets)
+            batch_metrics = self.metrics(predictions.detach().float(), targets)
 
         return loss.item(), batch_metrics
 
@@ -337,10 +364,13 @@ class Trainer:
         inputs = self._move_to_device(inputs)
         targets = self._move_to_device(targets)
 
-        predictions = self.model(inputs)
-        loss = self.loss_fn(predictions, targets)
+        # No-op context (enabled=False) when AMP is off, matching prior
+        # (fp32) behavior exactly; no backward pass occurs during validation.
+        with torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+            predictions = self.model(inputs)
+            loss = self.loss_fn(predictions, targets)
 
-        batch_metrics = self.metrics(predictions, targets)
+        batch_metrics = self.metrics(predictions.float(), targets)
 
         return loss.item(), batch_metrics
 

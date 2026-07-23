@@ -2,7 +2,7 @@
 # Training Configuration
 # =============================================================================
 
-epochs: 100
+epochs: 50
 batch_size: 32
 
 learning_rate: 0.0001
@@ -24,9 +24,13 @@ early_stopping:
 
 checkpoint_dir: checkpoints/physatformer
 
-num_workers: 0
+num_workers: 4
 shuffle: true
 
 device: auto
 
-pin_memory: false
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+
+mixed_precision: true

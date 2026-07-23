@@ -572,34 +572,46 @@ def build_dataloaders(
     num_workers = train_cfg.get("num_workers", 0)
     pin_memory = train_cfg.get("pin_memory", False)
 
+    # persistent_workers / prefetch_factor are only valid (and only make
+    # sense) when num_workers > 0; DataLoader raises if passed otherwise.
+    persistent_workers = train_cfg.get("persistent_workers", False) and num_workers > 0
+    prefetch_factor = train_cfg.get("prefetch_factor", None) if num_workers > 0 else None
+
     logger.info(
         "Building DataLoaders (batch_size=%s, num_workers=%s, "
-        "pin_memory=%s)",
+        "pin_memory=%s, persistent_workers=%s, prefetch_factor=%s)",
         batch_size,
         num_workers,
         pin_memory,
+        persistent_workers,
+        prefetch_factor,
     )
+
+    loader_kwargs: dict[str, Any] = dict(
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
+    if prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
 
     logger.info(
@@ -905,17 +917,16 @@ def build_trainer(
     train_cfg: dict[str, Any],
     device: torch.device,
     logger: logging.Logger,
+    amp_enabled: bool = False,
+    scaler: "torch.cuda.amp.GradScaler | None" = None,
 ) -> Trainer:
     """Instantiate the existing `Trainer`, wiring in all collaborators.
 
-    `Trainer`'s real constructor only accepts `model, loss_fn, metrics,
-    optimizer, scheduler, checkpoint_manager, early_stopping, device,
-    gradient_clip_value` — it does not accept a physics matrix, data
-    loaders, a logger, an AMP scaler, or an `amp_enabled` flag (its
-    docstring states it is intentionally free of mixed-precision
-    training). Those extra objects described in `architecture.md` are
-    therefore NOT wired into `Trainer` here, since doing so would mean
-    inventing parameters that don't exist on the real class.
+    `Trainer`'s constructor accepts `model, loss_fn, metrics, optimizer,
+    scheduler, checkpoint_manager, early_stopping, device,
+    gradient_clip_value, amp_enabled, scaler`. `amp_enabled`/`scaler` are
+    optional and default to off, so this call is backward-compatible
+    with any caller that does not pass them.
 
     NOTE: `early_stopping.py` was not among the attached files.
     `EarlyStopping` is instantiated here as
@@ -933,6 +944,10 @@ def build_trainer(
         train_cfg: Parsed contents of ``train.yaml``.
         device: The resolved compute device.
         logger: Project logger used to report progress.
+        amp_enabled: Whether automatic mixed precision is enabled for
+            this run (as resolved by `setup_amp`).
+        scaler: The `torch.cuda.amp.GradScaler` instance to use when
+            `amp_enabled` is True, otherwise `None`.
 
     Returns:
         Trainer: The constructed trainer, ready for `fit()`.
@@ -975,6 +990,8 @@ def build_trainer(
         early_stopping=early_stopping,
         device=device,
         gradient_clip_value=gradient_clip_value,
+        amp_enabled=amp_enabled,
+        scaler=scaler,
     )
 
     return trainer
@@ -1074,12 +1091,7 @@ def main() -> None:
         mixed_precision=train_cfg.get("mixed_precision", False),
         device=device,
     )
-    if amp_enabled:
-        logger.warning(
-            "mixed_precision=True was requested, but the existing Trainer "
-            "does not implement autocast/GradScaler support, so AMP will "
-            "have no effect on this run."
-        )
+    logger.info("Automatic mixed precision enabled: %s", amp_enabled)
 
     mission = build_mission(dataset_cfg, logger)
     pipeline = build_pipeline(dataset_cfg, logger)
@@ -1123,6 +1135,8 @@ def main() -> None:
         train_cfg=train_cfg,
         device=device,
         logger=logger,
+        amp_enabled=amp_enabled,
+        scaler=scaler,
     )
 
     last_epoch = resume_checkpoint(
