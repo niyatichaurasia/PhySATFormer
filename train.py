@@ -39,7 +39,7 @@ from src.utils.constants import LOGGER_NAME
 # Additional imports required for Modules 4-6
 # =============================================================================
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from src.core.mission import Mission
 from src.preprocessing.pipeline import TelemetryPipeline
@@ -534,19 +534,232 @@ def build_datasets(
     return train_dataset, validation_dataset, test_dataset
 
 
+def configure_training_augmentation(
+    train_dataset: MissionDataset,
+    train_cfg: dict[str, Any],
+    seed: int,
+    logger: logging.Logger,
+) -> None:
+    """Enable anomaly-only augmentation on the training split, if configured.
+
+    Reads the ``augmentation`` section of ``train.yaml``::
+
+        augmentation:
+          enabled: true
+          probability: 0.6
+
+    and, only when enabled, switches ``train_dataset`` into training
+    mode with augmentation active via
+    ``MissionDataset.enable_anomaly_augmentation``. This function must
+    only ever be called with the *training* ``MissionDataset`` --
+    ``validation_dataset`` and ``test_dataset`` are intentionally never
+    passed to it anywhere in this file, so they keep their default
+    ``training=False`` state and are never augmented, regardless of
+    this configuration.
+
+    Args:
+        train_dataset: The training ``MissionDataset``, and only the
+            training ``MissionDataset``.
+        train_cfg: Parsed contents of ``train.yaml``.
+        seed: The resolved experiment seed (see ``set_random_seed`` in
+            ``main``), reused here so per-window augmentation draws are
+            deterministic under the same seed that governs the rest of
+            the run.
+        logger: Project logger used to report progress.
+    """
+    augmentation_cfg = train_cfg.get("augmentation", {}) or {}
+    augmentation_enabled = bool(augmentation_cfg.get("enabled", False))
+
+    if not augmentation_enabled:
+        logger.info(
+            "Anomaly-only augmentation disabled (augmentation.enabled=false)."
+        )
+        return
+
+    probability = float(augmentation_cfg.get("probability", 0.6))
+
+    train_dataset.enable_anomaly_augmentation(probability=probability, seed=seed)
+
+    # Explicit startup banner, in addition to the structured log line
+    # below, so augmentation state is impossible to miss when scanning
+    # console output at the start of a run.
+    print("Augmentation enabled")
+    print(f"Probability: {probability}")
+    print("Augmenting anomaly windows only")
+
+    logger.info(
+        "Anomaly-only augmentation enabled on training dataset "
+        "(probability=%.3f, seed=%s).",
+        probability,
+        seed,
+    )
+
+
+def compute_training_sample_weights(
+    train_dataset: MissionDataset,
+    logger: logging.Logger,
+) -> torch.Tensor:
+    """Compute per-window sampling weights for the training dataset.
+
+    Each training window is classified using the existing, index-aligned
+    ``MissionDataset`` contract:
+
+        * "anomaly window" -- at least one channel-timestep in the
+          window's label tensor is anomalous (label > 0).
+        * "normal window"  -- every channel-timestep in the window is
+          non-anomalous.
+
+    Per-class weights are then derived automatically from the observed
+    class counts via inverse-frequency weighting
+
+        weight_c = num_windows / (num_classes * count_c)
+
+    so that, in expectation, a ``WeightedRandomSampler`` built from the
+    returned per-window weights draws normal and anomaly windows in
+    roughly equal proportion each epoch -- no magic numbers, purely a
+    function of the dataset's own statistics.
+
+    This function only reads ``train_dataset`` through its existing
+    public ``Dataset`` contract (``__len__`` / ``__getitem__``). It does
+    not construct, mutate, or reorder the dataset in any way; window
+    contents and their on-disk/back-end ordering are left untouched.
+    Only the *sampling* of indices during training is later affected by
+    the weights computed here.
+
+    Args:
+        train_dataset: The training MissionDataset.
+        logger: Project logger used to report progress.
+
+    Returns:
+        torch.Tensor: A 1D float64 tensor of shape
+        ``(len(train_dataset),)`` holding one sampling weight per
+        training window, index-aligned with ``train_dataset``.
+
+    Raises:
+        ValueError: If the training dataset is empty, or if every
+            window falls into a single class (balancing is impossible).
+    """
+    num_windows = len(train_dataset)
+    if num_windows == 0:
+        raise ValueError(
+            "Cannot compute sample weights: train_dataset is empty."
+        )
+
+    is_anomaly = torch.zeros(num_windows, dtype=torch.bool)
+    for idx in range(num_windows):
+        # Only the label half of the (telemetry, label) pair is used;
+        # this deliberately goes through MissionDataset's normal
+        # __getitem__ so no assumptions are made about its internal
+        # storage (LazyWindowSet vs. dense array) beyond the documented
+        # Dataset contract.
+        _, label_window = train_dataset[idx]
+        is_anomaly[idx] = bool(torch.any(label_window > 0))
+
+    num_anomaly = int(is_anomaly.sum().item())
+    num_normal = num_windows - num_anomaly
+
+    if num_anomaly == 0 or num_normal == 0:
+        raise ValueError(
+            "Cannot build a WeightedRandomSampler: the training dataset "
+            f"contains only one class (normal={num_normal}, "
+            f"anomaly={num_anomaly}). Set 'sampler.enabled: false' in "
+            "train.yaml to fall back to standard shuffling."
+        )
+
+    # Inverse-frequency class weights, computed purely from observed
+    # counts. Rarer windows (anomalies) receive proportionally larger
+    # weights; no values are hardcoded.
+    normal_weight = num_windows / (2.0 * num_normal)
+    anomaly_weight = num_windows / (2.0 * num_anomaly)
+
+    sample_weights = torch.where(
+        is_anomaly,
+        torch.full((num_windows,), anomaly_weight, dtype=torch.float64),
+        torch.full((num_windows,), normal_weight, dtype=torch.float64),
+    )
+
+    logger.info("Training windows: %d", num_windows)
+    logger.info("Normal windows: %d", num_normal)
+    logger.info("Anomaly windows: %d", num_anomaly)
+    logger.info("Normal weight: %.6f", normal_weight)
+    logger.info("Anomaly weight: %.6f", anomaly_weight)
+
+    return sample_weights
+
+
+def build_train_sampler(
+    train_dataset: MissionDataset,
+    train_cfg: dict[str, Any],
+    logger: logging.Logger,
+) -> "WeightedRandomSampler | None":
+    """Optionally construct a WeightedRandomSampler for the train loader.
+
+    Controlled entirely by the ``sampler`` section of ``train.yaml``:
+
+        sampler:
+          enabled: true
+
+    When ``sampler.enabled`` is missing or ``false``, this returns
+    ``None`` and training behaves exactly as before -- ``build_dataloaders``
+    falls back to plain ``shuffle=True`` for the training loader.
+    Validation and test loaders are never affected by this setting; they
+    are constructed with ``shuffle=False`` unconditionally.
+
+    Args:
+        train_dataset: The training MissionDataset.
+        train_cfg: Parsed contents of ``train.yaml``.
+        logger: Project logger used to report progress.
+
+    Returns:
+        Optional[WeightedRandomSampler]: The constructed sampler, or
+        ``None`` if disabled.
+    """
+    sampler_cfg = train_cfg.get("sampler", {}) or {}
+    sampler_enabled = bool(sampler_cfg.get("enabled", False))
+
+    if not sampler_enabled:
+        logger.info(
+            "WeightedRandomSampler disabled (sampler.enabled=false); "
+            "using standard shuffling for the training loader."
+        )
+        return None
+
+    sample_weights = compute_training_sample_weights(train_dataset, logger)
+
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    logger.info("Using WeightedRandomSampler")
+
+    return sampler
+
+
 def build_dataloaders(
     train_dataset: MissionDataset,
     validation_dataset: MissionDataset,
     test_dataset: MissionDataset,
     train_cfg: dict[str, Any],
     logger: logging.Logger,
+    train_sampler: "WeightedRandomSampler | None" = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Construct train/validation/test DataLoaders.
 
     Reads ``batch_size``, ``num_workers``, and ``pin_memory`` from the
-    training configuration. The training loader always shuffles;
-    validation and test loaders never shuffle, regardless of any
-    ``shuffle`` value present in ``train_cfg``.
+    training configuration.
+
+    Training loader:
+        * If ``train_sampler`` is provided (i.e. ``sampler.enabled: true``
+          in train.yaml), it is used via the ``sampler=`` argument and
+          ``shuffle`` is omitted (PyTorch's ``DataLoader`` disallows
+          passing both ``shuffle=True`` and ``sampler`` together).
+        * Otherwise the loader falls back to ``shuffle=True``, i.e. the
+          original behavior.
+
+    Validation and test loaders are always constructed with
+    ``shuffle=False`` and are completely unaffected by ``train_sampler``.
 
     Args:
         train_dataset: The training MissionDataset.
@@ -554,6 +767,9 @@ def build_dataloaders(
         test_dataset: The test MissionDataset.
         train_cfg: Parsed contents of ``train.yaml``.
         logger: Project logger used to report progress.
+        train_sampler: An optional ``WeightedRandomSampler`` to use for
+            the training loader in place of ``shuffle=True``. Pass
+            ``None`` (the default) to preserve the original behavior.
 
     Returns:
         tuple[DataLoader, DataLoader, DataLoader]: The
@@ -595,12 +811,24 @@ def build_dataloaders(
     if prefetch_factor is not None:
         loader_kwargs["prefetch_factor"] = prefetch_factor
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        **loader_kwargs,
-    )
+    if train_sampler is not None:
+        # sampler= and shuffle=True are mutually exclusive in
+        # torch.utils.data.DataLoader; the sampler already governs draw
+        # order/frequency, so shuffle is simply omitted here.
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            **loader_kwargs,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            **loader_kwargs,
+        )
+
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=batch_size,
@@ -1103,12 +1331,38 @@ def main() -> None:
         logger=logger,
     )
 
+    # NOTE: sampler weights must be computed BEFORE augmentation is
+    # enabled. build_train_sampler() (via compute_training_sample_weights)
+    # iterates train_dataset[idx] to inspect labels, which goes through
+    # MissionDataset.__getitem__ -- if augmentation were already enabled,
+    # that pass would needlessly consume augmentation RNG draws and
+    # augment telemetry that's immediately discarded (only labels are
+    # used for weighting). Running this first guarantees the sampler
+    # always sees raw, unaugmented windows.
+    train_sampler = build_train_sampler(
+        train_dataset=train_dataset,
+        train_cfg=train_cfg,
+        logger=logger,
+    )
+
+    # Augmentation is enabled only after sampler weights are computed.
+    # DataLoader construction below is lazy (it does not call
+    # __getitem__ until iterated during training), so training still
+    # receives augmented anomaly windows exactly as before.
+    configure_training_augmentation(
+        train_dataset=train_dataset,
+        train_cfg=train_cfg,
+        seed=seed,
+        logger=logger,
+    )
+
     train_loader, validation_loader, test_loader = build_dataloaders(
         train_dataset=train_dataset,
         validation_dataset=validation_dataset,
         test_dataset=test_dataset,
         train_cfg=train_cfg,
         logger=logger,
+        train_sampler=train_sampler,
     )
 
     physics_matrix = build_physics_matrix(mission, logger)

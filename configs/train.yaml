@@ -34,3 +34,29 @@ persistent_workers: true
 prefetch_factor: 4
 
 mixed_precision: true
+
+# =============================================================================
+# Training Sampler (imbalance handling)
+# =============================================================================
+# When enabled, the training DataLoader uses a WeightedRandomSampler
+# built from per-window anomaly statistics (see build_train_sampler /
+# compute_training_sample_weights in train.py) instead of shuffle=True.
+# Weights are computed automatically from the dataset's own class
+# counts (inverse-frequency) -- nothing here is hardcoded per-dataset.
+# Validation and test loaders are never affected by this setting.
+sampler:
+  enabled: true
+
+# =============================================================================
+# Anomaly-Only Augmentation
+# =============================================================================
+# When enabled, MissionDataset augments a training window (see
+# enable_anomaly_augmentation in src/preprocessing/dataset.py and
+# src/data/augmentations.py) only if:
+#   - this is the training dataset (never validation/test), AND
+#   - the window contains at least one anomalous label, AND
+#   - a per-window random draw falls below `probability`.
+# Normal windows and validation/test windows are never augmented.
+augmentation:
+  enabled: true
+  probability: 0.6
