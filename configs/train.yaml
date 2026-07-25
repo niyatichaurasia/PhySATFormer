@@ -44,8 +44,8 @@ mixed_precision: true
 # Weights are computed automatically from the dataset's own class
 # counts (inverse-frequency) -- nothing here is hardcoded per-dataset.
 # Validation and test loaders are never affected by this setting.
-sampler:
-  enabled: true
+#sampler:
+ # enabled: true
 
 # =============================================================================
 # Anomaly-Only Augmentation
@@ -57,6 +57,13 @@ sampler:
 #   - the window contains at least one anomalous label, AND
 #   - a per-window random draw falls below `probability`.
 # Normal windows and validation/test windows are never augmented.
+#augmentation:
+ # enabled: true
+  #probability: 0.6
+
+sampler:
+  enabled: false     # was true — pos_weight now handles imbalance without distorting the input distribution
+
 augmentation:
   enabled: true
-  probability: 0.6
+  probability: 0.3   # was 0.6 — reduce reliance on synthetic anomaly patterns

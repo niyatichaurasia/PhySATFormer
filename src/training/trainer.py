@@ -350,15 +350,22 @@ class Trainer:
         return loss.item(), batch_metrics
 
     @torch.no_grad()
-    def _validation_step(self, batch: Any) -> Tuple[float, Dict[str, torch.Tensor]]:
+    def _validation_step(
+        self, batch: Any
+    ) -> Tuple[float, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         Execute a single validation step: forward and loss computation only
         (no gradients, no optimizer step).
 
         Returns:
-            A `(loss_value, batch_metrics)` tuple, where `loss_value` is
-            the scalar validation loss (float) for this batch and
-            `batch_metrics` is the raw dict returned by `PhySATMetrics`.
+            A `(loss_value, batch_metrics, logits, targets)` tuple, where
+            `loss_value` is the scalar validation loss (float) for this
+            batch, `batch_metrics` is the raw dict returned by
+            `PhySATMetrics`, and `logits`/`targets` (both detached,
+            moved to CPU) are returned so callers can optionally build a
+            bounded random sample for ranking-metric (AUROC/AUPRC)
+            computation without holding every batch's full predictions
+            in memory.
         """
         inputs, targets = self._unpack_batch(batch)
         inputs = self._move_to_device(inputs)
@@ -370,9 +377,76 @@ class Trainer:
             predictions = self.model(inputs)
             loss = self.loss_fn(predictions, targets)
 
-        batch_metrics = self.metrics(predictions.float(), targets)
+        predictions = predictions.float()
+        batch_metrics = self.metrics(predictions, targets)
 
-        return loss.item(), batch_metrics
+        return loss.item(), batch_metrics, predictions.detach().cpu(), targets.detach().cpu()
+
+    class _BoundedRandomSampleCollector:
+        """
+        Collects a bounded, approximately-uniform random sample of
+        (logit, target) element pairs across an entire epoch, for
+        computing AUROC/AUPRC without ever holding every element of the
+        split in memory at once.
+
+        AUROC/AUPRC require sorting every element they're computed
+        over, so computing them on a fully-flattened validation split
+        (batch * sequence_length * num_channels elements, potentially
+        hundreds of millions) is both slow and memory-heavy every
+        epoch. Instead, each batch contributes a random subsample of at
+        most `per_batch_cap` elements; if the running total across the
+        epoch exceeds `max_total`, a final random subsample trims it
+        back down. This mirrors the bounded-sample approach already
+        used elsewhere in this codebase for fitting the telemetry
+        normalizer on a capped number of windows.
+
+        This is an approximation, not exact reservoir sampling (batches
+        are not perfectly equal-sized so the resulting sample is not
+        perfectly uniform across the full split), but it is close
+        enough for monitoring AUROC/AUPRC during training, which does
+        not require sample-exact precision.
+        """
+
+        def __init__(
+            self,
+            per_batch_cap: int = 20_000,
+            max_total: int = 2_000_000,
+            seed: int = 0,
+        ) -> None:
+            self.per_batch_cap = per_batch_cap
+            self.max_total = max_total
+            self._generator = torch.Generator().manual_seed(seed)
+            self._logits: List[torch.Tensor] = []
+            self._targets: List[torch.Tensor] = []
+
+        def update(self, logits: torch.Tensor, targets: torch.Tensor) -> None:
+            flat_logits = logits.reshape(-1)
+            flat_targets = targets.reshape(-1)
+            n = flat_logits.numel()
+
+            if n > self.per_batch_cap:
+                idx = torch.randperm(n, generator=self._generator)[: self.per_batch_cap]
+                flat_logits = flat_logits[idx]
+                flat_targets = flat_targets[idx]
+
+            self._logits.append(flat_logits)
+            self._targets.append(flat_targets)
+
+        def compute(self) -> Tuple[torch.Tensor, torch.Tensor]:
+            if not self._logits:
+                return torch.empty(0), torch.empty(0)
+
+            logits = torch.cat(self._logits)
+            targets = torch.cat(self._targets)
+
+            if logits.numel() > self.max_total:
+                idx = torch.randperm(logits.numel(), generator=self._generator)[
+                    : self.max_total
+                ]
+                logits = logits[idx]
+                targets = targets[idx]
+
+            return logits, targets
 
     # ------------------------------------------------------------------ #
     # Epoch-level public API
@@ -421,18 +495,36 @@ class Trainer:
                 yielding `(window, label)` batches.
 
         Returns:
-            A dict with keys: "loss", "precision", "recall", "f1", aggregated
-            over the entire epoch.
+            A dict with keys: "loss", "precision", "recall", "f1",
+            "auroc", "auprc", aggregated over the entire epoch.
+            "auroc"/"auprc" are computed on a bounded random sample of
+            this epoch's predictions (see `_BoundedRandomSampleCollector`),
+            not the exact full split, to keep per-epoch cost bounded.
         """
         self.model.eval()
         accumulator = self._MetricAccumulator(self.metrics)
+        ranking_sample = self._BoundedRandomSampleCollector()
 
         with torch.no_grad():
             for batch in validation_loader:
-                batch_loss, batch_metrics = self._validation_step(batch)
+                batch_loss, batch_metrics, logits, targets = self._validation_step(batch)
                 accumulator.update(batch_loss, batch_metrics)
+                ranking_sample.update(logits, targets)
 
-        return accumulator.compute()
+        results = accumulator.compute()
+
+        sample_logits, sample_targets = ranking_sample.compute()
+        if sample_logits.numel() > 0:
+            ranking_metrics = self.metrics.compute_ranking_metrics(
+                sample_logits, sample_targets
+            )
+            results["auroc"] = float(ranking_metrics["auroc"].item())
+            results["auprc"] = float(ranking_metrics["auprc"].item())
+        else:
+            results["auroc"] = float("nan")
+            results["auprc"] = float("nan")
+
+        return results
 
     # ------------------------------------------------------------------ #
     # Checkpointing / summary helpers
@@ -477,7 +569,9 @@ class Trainer:
             f"val_loss={val_metrics['loss']:.4f} "
             f"val_f1={val_metrics['f1']:.4f} "
             f"val_precision={val_metrics['precision']:.4f} "
-            f"val_recall={val_metrics['recall']:.4f}"
+            f"val_recall={val_metrics['recall']:.4f} "
+            f"val_auroc={val_metrics.get('auroc', float('nan')):.4f} "
+            f"val_auprc={val_metrics.get('auprc', float('nan')):.4f}"
             + (" | checkpoint saved" if checkpoint_saved else "")
         )
 
@@ -493,6 +587,8 @@ class Trainer:
             "val_precision": [],
             "train_recall": [],
             "val_recall": [],
+            "val_auroc": [],
+            "val_auprc": [],
         }
 
     @staticmethod
@@ -510,6 +606,8 @@ class Trainer:
         history["val_precision"].append(val_metrics["precision"])
         history["train_recall"].append(train_metrics["recall"])
         history["val_recall"].append(val_metrics["recall"])
+        history["val_auroc"].append(val_metrics.get("auroc", float("nan")))
+        history["val_auprc"].append(val_metrics.get("auprc", float("nan")))
 
     # ------------------------------------------------------------------ #
     # Top-level training loop

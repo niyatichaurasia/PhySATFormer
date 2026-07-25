@@ -1079,28 +1079,89 @@ def build_scheduler(
     return scheduler
 
 
-def build_criterion(logger: logging.Logger) -> PhySATLoss:
+def compute_pos_weight(
+    train_dataset: MissionDataset,
+    logger: logging.Logger,
+    max_val: float = 50.0,
+) -> torch.Tensor:
+    """Compute a per-channel BCEWithLogitsLoss pos_weight from TRUE label
+    prevalence in the (unbalanced, unaugmented-at-this-point) training set.
+
+    pos_weight[c] = (# negative timestep-labels for channel c) /
+                    (# positive timestep-labels for channel c)
+
+    This is computed from the REAL class prevalence -- not the
+    artificially-balanced ratio the WeightedRandomSampler produces --
+    so that imbalance correction happens in the loss's gradient
+    scaling rather than by distorting the input distribution the model
+    is trained on. That keeps the model's learned calibration anchored
+    to the real-world prior it will actually see at validation/test
+    time. Clamped to `max_val` to avoid exploding weights for
+    near-empty channels.
+
+    IMPORTANT: call this with `train_dataset` BEFORE
+    `enable_anomaly_augmentation` has been called on it, so prevalence
+    reflects real data, not augmentation-inflated counts.
+    """
+    num_channels = None
+    pos_counts = None
+    total_timesteps = 0
+
+    for idx in range(len(train_dataset)):
+        _, label_window = train_dataset[idx]
+        if pos_counts is None:
+            num_channels = label_window.shape[-1]
+            pos_counts = torch.zeros(num_channels, dtype=torch.float64)
+        pos_counts += label_window.sum(dim=0).double()
+        total_timesteps += label_window.shape[0]
+
+    neg_counts = total_timesteps - pos_counts
+    pos_weight = (neg_counts / pos_counts.clamp(min=1.0)).clamp(max=max_val)
+
+    logger.info(
+        "Computed per-channel pos_weight from true label prevalence "
+        "(min=%.3f, mean=%.3f, max=%.3f, clamped at %.1f).",
+        pos_weight.min().item(),
+        pos_weight.mean().item(),
+        pos_weight.max().item(),
+        max_val,
+    )
+
+    return pos_weight.float()
+
+
+def build_criterion(
+    train_dataset: MissionDataset,
+    device: torch.device,
+    logger: logging.Logger,
+    use_pos_weight: bool = True,
+) -> PhySATLoss:
     """Construct the training/validation loss.
 
-    `Trainer` requires a `PhySATLoss` instance (it type-checks the
-    injected `loss_fn` against that exact class), so `PhySATLoss` is
-    reused here rather than substituting a bare
-    ``torch.nn.BCEWithLogitsLoss``, which `Trainer` would reject.
-
-    NOTE: `losses.py` was not among the attached files, so this calls
-    `PhySATLoss()` with no arguments based only on how `trainer.py`
-    invokes it (``self.loss_fn(predictions, targets)``, i.e. a plain
-    callable). If `PhySATLoss` requires constructor arguments, this
-    call must be updated to match its real signature.
+    Unlike the previous version (which called `PhySATLoss()` with no
+    arguments), this computes a per-channel `pos_weight` from the TRUE
+    (unbalanced) class prevalence in `train_dataset` and passes it to
+    `PhySATLoss`. This is the mechanism `PhySATLoss` was actually
+    designed to use for class imbalance -- see `losses.py`.
 
     Args:
+        train_dataset: The TRAINING MissionDataset, BEFORE
+            `enable_anomaly_augmentation` is called on it.
+        device: Device to move the computed pos_weight tensor to.
         logger: Project logger used to report progress.
+        use_pos_weight: If False, falls back to unweighted BCE (kept
+            as an escape hatch for ablation).
 
     Returns:
         PhySATLoss: The constructed loss instance.
     """
-    logger.info("Building PhySATLoss criterion.")  # ASSUMED API: PhySATLoss()
-    return PhySATLoss()
+    if not use_pos_weight:
+        logger.info("Building PhySATLoss criterion (no pos_weight).")
+        return PhySATLoss()
+
+    pos_weight = compute_pos_weight(train_dataset, logger).to(device)
+    logger.info("Building PhySATLoss criterion with per-channel pos_weight.")
+    return PhySATLoss(pos_weight=pos_weight)
 
 
 # =============================================================================
@@ -1289,6 +1350,68 @@ def resume_checkpoint(
 # =============================================================================
 
 
+def calibrate_threshold_on_validation(
+    trainer: Trainer,
+    validation_loader,
+    logger: logging.Logger,
+    max_elements: int = 2_000_000,
+) -> float:
+    """Calibrate the decision threshold on validation data, post-training.
+
+    Runs the CURRENT model in `trainer` (expected to already be the
+    best-val-F1 checkpoint, reloaded by the caller) over
+    `validation_loader`, collects a bounded random sample of raw logits
+    and targets (see `Trainer._BoundedRandomSampleCollector`), and finds
+    the threshold maximizing validation F1 via `PhySATMetrics.best_threshold`.
+
+    This threshold should be applied to the TEST set afterward, and must
+    never be re-fit on test data -- doing so would make test metrics an
+    optimistic, dishonest estimate of generalization.
+
+    Args:
+        trainer: A `Trainer` instance whose `.model` will be evaluated.
+        validation_loader: DataLoader for the validation split.
+        logger: Project logger used to report progress.
+        max_elements: Upper bound on how many (logit, target) elements
+            are collected before finding the best threshold.
+
+    Returns:
+        float: The threshold (in [0, 1]) maximizing validation F1.
+    """
+    trainer.model.eval()
+    collector = Trainer._BoundedRandomSampleCollector(max_total=max_elements)
+
+    with torch.no_grad():
+        for batch in validation_loader:
+            inputs, targets = trainer._unpack_batch(batch)
+            inputs = trainer._move_to_device(inputs)
+            targets = trainer._move_to_device(targets)
+
+            with torch.autocast(
+                device_type=trainer.device.type, enabled=trainer.amp_enabled
+            ):
+                logits = trainer.model(inputs)
+
+            collector.update(logits.float().detach().cpu(), targets.detach().cpu())
+
+    sample_logits, sample_targets = collector.compute()
+    best_threshold, best_f1 = trainer.metrics.best_threshold(
+        sample_logits, sample_targets
+    )
+
+    logger.info(
+        "Threshold calibration on validation set: best_threshold=%.3f "
+        "(val_f1=%.4f at this threshold, computed on a bounded sample of "
+        "%d elements). Default threshold was %.3f.",
+        best_threshold,
+        best_f1,
+        sample_logits.numel(),
+        trainer.metrics.threshold,
+    )
+
+    return best_threshold
+
+
 def main() -> None:
     """Orchestrate the full PhySATFormer training run.
 
@@ -1345,7 +1468,19 @@ def main() -> None:
         logger=logger,
     )
 
-    # Augmentation is enabled only after sampler weights are computed.
+    # pos_weight must also be computed from TRUE (pre-augmentation)
+    # label prevalence, for the same reason the sampler weights are --
+    # so it is computed here, before configure_training_augmentation()
+    # is called below.
+    criterion = build_criterion(
+        train_dataset=train_dataset,
+        device=device,
+        logger=logger,
+        use_pos_weight=True,
+    )
+
+    # Augmentation is enabled only after sampler weights (and pos_weight)
+    # are computed.
     # DataLoader construction below is lazy (it does not call
     # __getitem__ until iterated during training), so training still
     # receives augmented anomaly windows exactly as before.
@@ -1377,7 +1512,6 @@ def main() -> None:
 
     optimizer = build_optimizer(model, train_cfg, logger)
     scheduler = build_scheduler(optimizer, train_cfg, logger)
-    criterion = build_criterion(logger)
     metrics = build_metrics(logger)
 
     trainer = build_trainer(
@@ -1422,16 +1556,80 @@ def main() -> None:
     )
     logger.info("Final checkpoint saved to: %s", final_checkpoint_path)
 
+    # IMPORTANT: reload the BEST checkpoint (by val_f1) before final
+    # test evaluation. `trainer.model` currently holds whatever state
+    # training stopped at (e.g. the epoch early stopping fired on),
+    # which is NOT necessarily the best epoch -- checkpoints are saved
+    # separately whenever val_f1 improves, but the in-memory model is
+    # never rolled back to that best state. Without this, test metrics
+    # reflect an epoch that may be well past the point where validation
+    # performance was actually best.
+    if history["val_f1"]:
+        best_epoch_idx = int(torch.tensor(history["val_f1"]).argmax().item())
+        best_epoch = start_epoch + best_epoch_idx
+        best_val_f1 = history["val_f1"][best_epoch_idx]
+        best_checkpoint_path = (
+            trainer.checkpoint_manager.checkpoint_dir
+            / trainer.checkpoint_manager._DEFAULT_FILENAME_TEMPLATE.format(
+                epoch=best_epoch
+            )
+        )
+        logger.info(
+            "Reloading best checkpoint (epoch=%d, val_f1=%.4f) from %s "
+            "before test evaluation.",
+            best_epoch,
+            best_val_f1,
+            best_checkpoint_path,
+        )
+        trainer.checkpoint_manager.load_checkpoint(
+            checkpoint_path=best_checkpoint_path,
+            model=trainer.model,
+            optimizer=None,
+            scheduler=None,
+            device=device,
+        )
+    else:
+        logger.warning(
+            "No validation history recorded; evaluating test set on the "
+            "final in-memory model state (not necessarily the best)."
+        )
+
+    # Calibrate the decision threshold on the VALIDATION set, using the
+    # best checkpoint just reloaded above. Never fit this on test data --
+    # that would make test metrics an optimistic, dishonest estimate of
+    # generalization. The same threshold found here is then applied,
+    # unchanged, to the test set below.
+    calibrated_threshold = calibrate_threshold_on_validation(
+        trainer=trainer,
+        validation_loader=validation_loader,
+        logger=logger,
+    )
+    trainer.metrics = PhySATMetrics(
+        threshold=calibrated_threshold, eps=trainer.metrics.eps
+    )
+    logger.info(
+        "Using calibrated threshold=%.3f for final test evaluation "
+        "(instead of the default 0.5).",
+        calibrated_threshold,
+    )
+
     # Optional test evaluation, reusing Trainer's existing public
     # validate_epoch() method (generic over any loader) rather than
-    # implementing new test-loop logic.
+    # implementing new test-loop logic. validate_epoch() now also
+    # returns AUROC/AUPRC, computed on a bounded random sample -- these
+    # are threshold-independent, so they tell you whether the model
+    # ranks anomalies correctly regardless of where the threshold is set.
     test_metrics = trainer.validate_epoch(test_loader)
     logger.info(
-        "Test evaluation: loss=%.4f precision=%.4f recall=%.4f f1=%.4f",
+        "Test evaluation: loss=%.4f precision=%.4f recall=%.4f f1=%.4f "
+        "auroc=%.4f auprc=%.4f (threshold=%.3f)",
         test_metrics["loss"],
         test_metrics["precision"],
         test_metrics["recall"],
         test_metrics["f1"],
+        test_metrics.get("auroc", float("nan")),
+        test_metrics.get("auprc", float("nan")),
+        calibrated_threshold,
     )
 
     logger.info("Training complete.")
