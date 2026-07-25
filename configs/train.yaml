@@ -19,7 +19,7 @@ scheduler:
 gradient_clip: 1.0
 
 early_stopping:
-  patience: 10
+  patience: 50
   min_delta: 0.001
 
 checkpoint_dir: checkpoints/physatformer
