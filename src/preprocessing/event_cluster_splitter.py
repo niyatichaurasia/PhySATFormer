@@ -400,11 +400,11 @@ class EventClusterSplitter:
             if lower is None and upper is None:
                 mask = np.ones(len(synchronized_df), dtype=bool)
             elif lower is None:
-                mask = (timestamps <= upper).to_numpy()
+                mask = timestamps <= upper
             elif upper is None:
-                mask = (timestamps > lower).to_numpy()
+                mask = timestamps > lower
             else:
-                mask = ((timestamps > lower) & (timestamps <= upper)).to_numpy()
+                mask = ((timestamps > lower) & (timestamps <= upper))
 
             split_masks[assignment[cluster.cluster_id]] |= mask
 
@@ -439,6 +439,9 @@ class EventClusterSplitter:
         print("=" * 30)
         print("FINAL SPLIT REPORT")
         print("=" * 30)
+        total_clusters = len(clusters)
+        total_events = sum(len(cluster.events) for cluster in clusters)
+        total_windows = sum(window_counts.values())
 
         for split in ("train", "validation", "test"):
             split_clusters = [
@@ -468,9 +471,24 @@ class EventClusterSplitter:
             )
 
             print(f"\n[{split.upper()}]")
-            print(f"  event clusters       : {len(split_clusters)}")
-            print(f"  events               : {len(events)}")
-            print(f"  windows              : {window_counts.get(split, 0)}")
+            cluster_count = len(split_clusters)
+            event_count = len(events)
+            window_count = window_counts.get(split, 0)
+
+            print(
+                f"  event clusters       : {cluster_count} "
+                f"({100*cluster_count/total_clusters:.1f}%)"
+            )
+
+            print(
+                f"  events               : {event_count} "
+                f"({100*event_count/total_events:.1f}%)"
+            )
+
+            print(
+                f"  windows              : {window_count:,} "
+                f"({100*window_count/total_windows:.1f}%)"
+            )
             print(f"  anomaly rate         : {anomaly_rate:.4%}")
             print(f"  class distribution   : {dict(class_dist)}")
             print(f"  category distribution: {dict(category_dist)}")

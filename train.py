@@ -26,6 +26,7 @@ import random
 from pathlib import Path
 from typing import Any
 
+
 # Third-party
 import numpy as np
 import torch
@@ -1412,6 +1413,7 @@ def calibrate_threshold_on_validation(
     return best_threshold
 
 
+
 def main() -> None:
     """Orchestrate the full PhySATFormer training run.
 
@@ -1453,6 +1455,8 @@ def main() -> None:
         dataset_cfg=dataset_cfg,
         logger=logger,
     )
+
+    
 
     # NOTE: sampler weights must be computed BEFORE augmentation is
     # enabled. build_train_sampler() (via compute_training_sample_weights)
