@@ -4,15 +4,15 @@ src/preprocessing/pipeline.py
 TelemetryPipeline: orchestrates the complete preprocessing workflow for
 PhySATFormer. This module is a pure orchestrator -- it coordinates existing
 preprocessing components (TelemetryAssembler, IntervalLabelGenerator,
-WindowGenerator, TelemetryNormalizer, MissionDataset) and MUST NOT
-implement any preprocessing algorithms itself (no assembly, labeling,
-windowing, or normalization logic lives here).
+WindowGenerator, TelemetryNormalizer, MissionDataset, EventClusterSplitter)
+and MUST NOT implement any preprocessing algorithms itself (no assembly,
+labeling, windowing, splitting, or normalization logic lives here).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ from src.preprocessing.interval_label_generator import IntervalLabelGenerator
 from src.preprocessing.window_generator import WindowGenerator, LazyWindowSet
 from src.preprocessing.normalizer import TelemetryNormalizer
 from src.preprocessing.dataset import MissionDataset
+from src.preprocessing.event_cluster_splitter import EventClusterSplitter
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,10 @@ class TelemetryPipeline:
 
         Mission
           -> TelemetryAssembler            (synchronize raw telemetry)
-          -> chronological train/val/test split of synchronized telemetry
+          -> EventClusterSplitter           (event-cluster-aware
+                                              train/val/test split of
+                                              synchronized telemetry --
+                                              see NOTE on splitting below)
           -> IntervalLabelGenerator         (dense per-channel labels per split,
                                               computed on the raw, unwindowed
                                               telemetry DataFrame for each split)
@@ -56,6 +60,19 @@ class TelemetryPipeline:
                                               fully materialized split)
           -> MissionDataset objects
 
+    NOTE on splitting: the previous split cut the synchronized telemetry
+    chronologically, purely by row count. That produced a severe
+    anomaly-rate drift across splits (train=1.93%, validation=2.75%,
+    test=4.83%) on Mission1, because anomalies occur in temporal bursts
+    rather than uniformly over time. `EventClusterSplitter` instead
+    merges temporally-overlapping anomaly events into clusters and
+    greedily assigns whole clusters (never splitting one across
+    train/validation/test) to balance event count, anomaly prevalence,
+    class distribution, category distribution, and channel coverage
+    across the three splits. See `EventClusterSplitter`'s module
+    docstring for the full rationale, including its one accepted
+    limitation (a handful of windows at split-segment "seams").
+
     NOTE on ordering: TelemetryNormalizer operates strictly on already
     -windowed telemetry arrays of shape
     (num_windows, window_size, num_channels) -- it never accepts a
@@ -65,9 +82,8 @@ class TelemetryPipeline:
     per split and never straddle a split boundary; this is what actually
     prevents temporal leakage. Fitting the normalizer only on the
     resulting train windows (rather than on the train DataFrame) is
-    equivalent in this regard -- the train windows are already fully
-    disjoint, in time, from validation/test -- and it is the only order
-    compatible with TelemetryNormalizer's documented contract.
+    equivalent in this regard, and it is the only order compatible with
+    TelemetryNormalizer's documented contract.
 
     NOTE on memory (production-scale datasets): WindowGenerator windows
     can overlap heavily (stride < window_size), so the total number of
@@ -143,6 +159,10 @@ class TelemetryPipeline:
             window_size=self.window_size,
             stride=self.stride,
         )
+        self._splitter = EventClusterSplitter(
+            train_ratio=self.train_ratio,
+            validation_ratio=self.validation_ratio,
+        )
 
         logger.debug(
             "TelemetryPipeline initialized "
@@ -169,29 +189,30 @@ class TelemetryPipeline:
         Run the full preprocessing pipeline for a given mission.
 
         Pipeline stages (in order): telemetry assembly (loading +
-        synchronization), optional development truncation, chronological
-        train/validation/test split, dense channel-wise label generation
-        via IntervalLabelGenerator on each split's (unwindowed) telemetry
-        DataFrame, LAZY sliding-window generation via
-        `WindowGenerator.generate_lazy()` (which produces index-aligned
-        `LazyWindowSet` telemetry/label pairs per split without
-        materializing a dense windows array), and finally normalization
-        via TelemetryNormalizer -- fit on a bounded sample of train
-        telemetry windows, and applied lazily per-window inside each
+        synchronization), optional development truncation, event-cluster
+        train/validation/test split (see `EventClusterSplitter`), dense
+        channel-wise label generation via IntervalLabelGenerator on each
+        split's (unwindowed) telemetry DataFrame, LAZY sliding-window
+        generation via `WindowGenerator.generate_lazy()` (which produces
+        index-aligned `LazyWindowSet` telemetry/label pairs per split
+        without materializing a dense windows array), normalization via
+        TelemetryNormalizer -- fit on a bounded sample of train telemetry
+        windows, and applied lazily per-window inside each
         `MissionDataset` rather than eagerly to a fully materialized
-        split. Label windows are never normalized.
+        split -- and finally printing the FINAL SPLIT REPORT diagnostic.
+        Label windows are never normalized.
 
         Args:
             mission: Mission object to be preprocessed.
             channel_ids: Telemetry channel identifiers to assemble.
             max_rows: Optional cap on the number of synchronized telemetry
                 rows to process, applied immediately after assembly and
-                before the chronological train/validation/test split. This
-                is intended ONLY for development and debugging on
-                resource-constrained machines (e.g. quickly iterating on a
-                small slice of data). Leaving it as None (the default)
-                processes the full dataset and preserves existing
-                production behavior. Must be a positive int if provided.
+                before the train/validation/test split. This is intended
+                ONLY for development and debugging on resource-constrained
+                machines (e.g. quickly iterating on a small slice of
+                data). Leaving it as None (the default) processes the
+                full dataset and preserves existing production behavior.
+                Must be a positive int if provided.
 
         Returns:
             Tuple of (train_dataset, validation_dataset, test_dataset).
@@ -215,16 +236,31 @@ class TelemetryPipeline:
                 max_rows,
             )
 
-        train_df, validation_df, test_df = self._split_synchronized_telemetry(
-            synchronized_df
+        # Event-cluster split: merge temporally-overlapping anomaly
+        # events into clusters, greedily assign whole clusters to
+        # train/validation/test, then attach every telemetry row (event
+        # or normal) to the split of its nearest cluster. Replaces the
+        # previous plain chronological row-count split -- see
+        # EventClusterSplitter's module docstring and the NOTE on
+        # splitting in this class's docstring.
+        clusters = self._splitter.build_clusters(mission, synchronized_df.index)
+        assignment = self._splitter.assign_clusters(clusters)
+        split_dfs = self._splitter.split_dataframe(
+            synchronized_df, clusters, assignment
         )
+        train_df = split_dfs["train"]
+        validation_df = split_dfs["validation"]
+        test_df = split_dfs["test"]
 
         # Label generation operates on the raw (unnormalized) per-split
         # telemetry DataFrame. IntervalLabelGenerator only needs the
         # timestamp index and channel/column identity to align interval
         # annotations to rows -- it never reads telemetry values -- so it
         # is indifferent to normalization and must run on a DataFrame,
-        # before WindowGenerator, per its documented contract.
+        # before WindowGenerator, per its documented contract. It also
+        # only relies on `telemetry.index` being sorted (via
+        # `searchsorted`), which event-cluster-split DataFrames still
+        # are, even though they are no longer a single contiguous range.
         train_labels = self._label_generator.generate(mission, train_df)
         validation_labels = self._label_generator.generate(mission, validation_df)
         test_labels = self._label_generator.generate(mission, test_df)
@@ -239,10 +275,9 @@ class TelemetryPipeline:
         # dense label matrix and emits two index-aligned LazyWindowSet
         # objects (telemetry, labels) instead of materialized 3D numpy
         # arrays. Running this per split (on data that was already split
-        # chronologically above) guarantees no window straddles a split
-        # boundary, which is what actually prevents temporal leakage.
-        # LazyWindowSet preserves window ordering exactly -- see
-        # WindowGenerator's equivalence with its own eager generate().
+        # above) guarantees no window straddles a train/validation/test
+        # boundary. LazyWindowSet preserves window ordering exactly --
+        # see WindowGenerator's equivalence with its own eager generate().
         train_telemetry_windows, train_label_windows = (
             self._window_generator.generate_lazy(train_df, train_labels)
         )
@@ -307,6 +342,24 @@ class TelemetryPipeline:
             len(test_dataset),
         )
 
+        # FINAL SPLIT REPORT: verifies the new event-cluster split is
+        # healthy (balanced event/prevalence/class/category/channel
+        # coverage across splits) before retraining.
+        self._splitter.print_report(
+            clusters=clusters,
+            assignment=assignment,
+            dense_labels={
+                "train": train_labels,
+                "validation": validation_labels,
+                "test": test_labels,
+            },
+            window_counts={
+                "train": len(train_dataset),
+                "validation": len(validation_dataset),
+                "test": len(test_dataset),
+            },
+        )
+
         return train_dataset, validation_dataset, test_dataset
 
     # ------------------------------------------------------------------
@@ -367,42 +420,6 @@ class TelemetryPipeline:
         for out_i, window_i in enumerate(indices):
             sample[out_i] = lazy_windows[int(window_i)]
         return sample
-
-    def _split_synchronized_telemetry(self, synchronized_df):
-        """
-        Split the synchronized telemetry DataFrame chronologically into
-        train/validation/test segments using train_ratio and
-        validation_ratio, BEFORE normalization, label generation, and
-        window generation. Windows are generated independently per
-        segment so that no window straddles a split boundary, preventing
-        temporal data leakage between splits.
-        """
-        num_samples = len(synchronized_df)
-        if num_samples == 0:
-            raise ValueError(
-                "TelemetryAssembler produced 0 synchronized samples; cannot "
-                "split empty telemetry into train/validation/test."
-            )
-
-        train_end = int(np.floor(self.train_ratio * num_samples))
-        validation_end = train_end + int(np.floor(self.validation_ratio * num_samples))
-
-        train_df = synchronized_df.iloc[:train_end]
-        validation_df = synchronized_df.iloc[train_end:validation_end]
-        test_df = synchronized_df.iloc[validation_end:]
-
-        if len(train_df) == 0:
-            raise ValueError(
-                "Computed an empty training split; increase train_ratio or "
-                "the number of synchronized samples."
-            )
-        if len(test_df) == 0:
-            raise ValueError(
-                "Computed an empty test split; decrease train_ratio/"
-                "validation_ratio or increase the number of synchronized samples."
-            )
-
-        return train_df, validation_df, test_df
 
     @staticmethod
     def _validate_telemetry_label_alignment(
