@@ -21,6 +21,6 @@ num_temporal_layers: 4
 ff_dim: 512
 
 # Regularization
-dropout: 0.1
+dropout: 0.15
 
 model_type: physatformer

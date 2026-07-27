@@ -5,21 +5,22 @@
 epochs: 100
 batch_size: 64
 
-learning_rate: 0.0001
-weight_decay: 0.01
+learning_rate: 0.0002
+weight_decay: 0.001
 
 optimizer:
   betas: [0.9, 0.999]
   eps: 1.0e-8
 
 scheduler:
-  t_max: 50
-  eta_min: 1.0e-6
+  name: CosineAnnealingLR
+  T_max: 100
+  eta_min: 0.000001
 
 gradient_clip: 1.0
 
 early_stopping:
-  patience: 50
+  patience: 20
   min_delta: 0.001
 
 checkpoint_dir: checkpoints/physatformer
