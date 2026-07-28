@@ -1,303 +1,235 @@
 # PhySATFormer
 
-> **Physics-Guided Spatio-Temporal Transformer for Channel-Level Telemetry Anomaly Localization**
+> **Physics-Guided Transformer for Channel-Level Spacecraft Telemetry Anomaly Localization**
 
-PhySATFormer is a research framework for **spacecraft telemetry anomaly localization** using a **Physics-Guided Transformer**.
+PhySATFormer is a modular PyTorch-based research framework for **channel-level anomaly localization** in multivariate spacecraft telemetry.
 
-Unlike conventional anomaly detectors that only determine whether a telemetry window is anomalous, PhySATFormer performs **fine-grained spatio-temporal localization**, identifying **which telemetry channels become anomalous and when**.
-
-The core contribution is the incorporation of **physics-based subsystem relationships** into the Transformer attention mechanism, allowing the model to exploit prior engineering knowledge during representation learning.
+The project combines a configurable preprocessing pipeline, Transformer-based sequence modeling, and physics-guided attention mechanisms to investigate anomaly localization across telemetry channels and time.
 
 ---
 
-## Research Objective
+# Features
 
-Given multivariate spacecraft telemetry,
-
-```
-Telemetry
-(batch, sequence_length, channels)
-```
-
-predict
-
-```
-Anomaly Labels
-(batch, sequence_length, channels)
-```
-
-where each prediction answers:
-
-> **"Is this telemetry channel anomalous at this timestep?"**
-
-This transforms anomaly detection into a **channel-level spatio-temporal localization** problem rather than a simple binary classification task.
-
----
-
-# Architecture
-
-```
-Telemetry
-(B,T,C)
-
-        │
-        ▼
-
-Telemetry Channel Encoder
-
-        │
-        ▼
-
-Physics-Guided Channel Attention
-
-        │
-        ▼
-
-Channel Attention Blocks
-
-        │
-        ▼
-
-Channel Pooling
-
-        │
-        ▼
-
-Temporal Transformer Encoder
-
-        │
-        ▼
-
-Prediction Head
-
-        │
-        ▼
-
-Channel-Level Anomaly Logits
-(B,T,C)
-```
-
----
-
-# Key Features
-
-- Physics-guided channel attention
-- Transformer-based temporal modeling
-- Channel-level anomaly localization
-- Spatio-temporal predictions
 - Modular preprocessing pipeline
-- Reproducible experiment configuration
-- Training framework with checkpointing and early stopping
-- Explainability-ready architecture
+- Transformer-based sequence modeling
+- Physics-guided attention mechanisms
+- YAML-based configuration system
+- Training and evaluation pipelines
+- Model checkpointing
+- Explainability modules
+- Research-oriented repository structure
 
 ---
 
 # Repository Structure
 
-```
+```text
 physatformer/
 
 ├── configs/
-│   ├── dataset.yaml
-│   ├── model.yaml
-│   └── train.yaml
-│
+├── data/
+├── docs/
+├── outputs/
+├── paper/
+├── scripts/
 ├── src/
 │   ├── core/
+│   ├── data/
+│   ├── evaluation/
+│   ├── explainability/
 │   ├── models/
 │   ├── preprocessing/
 │   ├── training/
-│   ├── explainability/
-│   ├── evaluation/
-│   └── utils/
+│   ├── utils/
+│   └── visualization/
 │
-├── scripts/
-├── checkpoints/
-├── logs/
-├── outputs/
-├── paper/
-│
-├── README.md
 ├── pyproject.toml
+├── uv.lock
+├── README.md
 └── requirements.txt
 ```
 
 ---
 
-# Core Components
+# Prerequisites
 
-## Preprocessing
-
-- Mission abstraction
-- Metadata parsing
-- Telemetry assembly
-- Normalization
-- Window generation
-- Interval label generation
-- Dataset construction
-
----
-
-## Model
-
-The model consists of two stages.
-
-### Physics-Guided Channel Modeling
-
-Learns relationships between telemetry channels while incorporating prior subsystem knowledge through a Physics Relationship Matrix.
-
-### Temporal Modeling
-
-Models long-range temporal dependencies using Transformer encoder blocks after channel interactions have been aggregated.
-
----
-
-# Physics Prior
-
-A Physics Relationship Matrix is constructed from spacecraft subsystem metadata.
-
-Instead of allowing every telemetry channel to attend equally, the model biases attention toward physically related channels.
-
-This embeds engineering knowledge directly into the attention mechanism while preserving end-to-end learning.
-
----
-
-# Model Output
-
-PhySATFormer predicts
-
-```
-(batch_size,
- sequence_length,
- num_channels)
-```
-
-Each element is an independent anomaly prediction for one telemetry channel at one timestep.
-
-The model outputs **raw logits**, trained using **BCEWithLogitsLoss**.
-
----
-
-# Training Pipeline
-
-The training framework includes
-
-- AdamW optimizer
-- Cosine Annealing learning rate scheduler
-- Gradient clipping
-- Early stopping
-- Model checkpointing
-- Automatic metric tracking
-
----
-
-# Evaluation
-
-Performance is evaluated using
-
-- Precision
-- Recall
-- F1-score
-- Channel-wise Precision
-- Channel-wise Recall
-- Channel-wise F1
-
-The objective is not only to detect anomalies but also to accurately localize them across telemetry channels and time.
-
----
-
-# Explainability
-
-The framework is designed to support post-hoc explainability through
-
-- Attention visualization
-- Channel importance analysis
-- Physics-guided attention inspection
-- SHAP-based explanations
-- Temporal attribution analysis
-
----
-
-# Configuration
-
-Experiments are configured using YAML files.
-
-```
-configs/
-
-dataset.yaml
-
-model.yaml
-
-train.yaml
-```
-
-This enables reproducible experiments and straightforward hyperparameter tuning.
+- Python **3.12**
+- Git
+- **uv** package manager
 
 ---
 
 # Installation
 
-Clone the repository
+## 1. Clone the repository
 
 ```bash
-git clone https://github.com/<username>/physatformer.git
+git clone <repository-url>
 cd physatformer
 ```
 
-Install dependencies
+---
+
+## 2. Install uv
+
+If you do not already have **uv** installed:
 
 ```bash
-pip install -r requirements.txt
+pip install uv
 ```
 
-or
+Alternatively, install it using the official Astral installation instructions:
+
+https://docs.astral.sh/uv/
+
+---
+
+## 3. Create a virtual environment
+
+```bash
+uv venv
+```
+
+---
+
+## 4. Activate the virtual environment
+
+### Windows PowerShell
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+### Windows Command Prompt
+
+```cmd
+.venv\Scripts\activate.bat
+```
+
+### Linux / macOS
+
+```bash
+source .venv/bin/activate
+```
+
+---
+
+## 5. Install project dependencies
 
 ```bash
 uv sync
 ```
 
+This installs all project dependencies specified in `pyproject.toml` and locked in `uv.lock`.
+
 ---
 
-# Running Training
+## 6. Verify the installation
+
+Check your Python version:
 
 ```bash
-python train.py
+python --version
+```
+
+Expected output:
+
+```text
+Python 3.12.x
+```
+
+Verify PyTorch is installed:
+
+```bash
+python -c "import torch; print(torch.__version__)"
 ```
 
 ---
 
-# Project Status
+# Configuration
 
-Current implementation includes
+Project configuration files are located in:
 
-- Physics-guided Transformer architecture
-- Complete telemetry preprocessing pipeline
-- Modular training framework
-- Configuration-based experiment management
+```text
+configs/
+```
 
-Upcoming work includes
+These configuration files define:
 
-- End-to-end training
-- Explainability module
-- Benchmark experiments
-- Ablation studies
-- IEEE paper figures and evaluation
+- Dataset settings
+- Model hyperparameters
+- Training parameters
+
+Modify the appropriate configuration file before running experiments.
 
 ---
 
-# Research Contribution
+# Repository Components
 
-PhySATFormer introduces a **physics-guided attention mechanism** for multivariate spacecraft telemetry, combining prior subsystem knowledge with Transformer-based sequence modeling to achieve **channel-level spatio-temporal anomaly localization**.
+## `src/preprocessing`
+
+Contains the preprocessing pipeline responsible for preparing raw telemetry for model training.
+
+---
+
+## `src/models`
+
+Contains the model implementations, including the Transformer architecture and physics-guided components.
+
+---
+
+## `src/training`
+
+Contains the training pipeline, optimization logic, checkpoint handling, and training utilities.
+
+---
+
+## `src/evaluation`
+
+Contains evaluation utilities and performance metrics.
+
+---
+
+## `src/explainability`
+
+Contains explainability and post-hoc analysis utilities.
+
+---
+
+## `scripts`
+
+Contains executable scripts used throughout the project.
+
+---
+
+# Development
+
+Install development dependencies:
+
+```bash
+uv sync --dev
+```
+
+After making changes, run the project's configured quality checks before committing.
+
+---
+
+# Contributing
+
+1. Fork the repository.
+2. Create a feature branch.
+3. Make your changes.
+4. Run all project checks.
+5. Submit a pull request.
 
 ---
 
 # License
 
-This project is released under the MIT License.
+Add the appropriate project license here.
 
 ---
 
 # Citation
 
-If you use this repository in your research, please cite the accompanying paper (to be released).
+If you use this repository in academic research, please cite the associated publication once it becomes available.

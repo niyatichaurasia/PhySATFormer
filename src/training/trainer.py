@@ -473,7 +473,7 @@ class Trainer:
         accumulator = self._MetricAccumulator(self.metrics)
 
         for batch_idx, batch in enumerate(train_loader):
-            if batch_idx % 2000 == 0:
+            if batch_idx % 1000 == 0:
                 print(f"Batch {batch_idx}/{len(train_loader)}")
 
             batch_loss, batch_metrics = self._training_step(batch)
